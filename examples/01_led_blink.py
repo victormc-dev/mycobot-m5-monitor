@@ -1,0 +1,62 @@
+# coding=utf-8
+"""官方文档 6.1.1「Python 简单使用」的 LED 闪烁示例（参数化 + 安全确认）。
+
+    python examples\\01_led_blink.py --dry-run
+    python examples\\01_led_blink.py --port COM3 --loops 3
+"""
+
+import argparse
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import bootstrap  # noqa: E402  自动引导依赖
+from pymycobot.mycobot280 import MyCobot280  # noqa: E402
+
+
+def main():
+    ap = argparse.ArgumentParser(description="myCobot 280 M5 末端 RGB 灯闪烁")
+    ap.add_argument("--port", default="", help="串口号，如 COM3（先跑 check_env.py 查看）")
+    ap.add_argument("--baud", type=int, default=115200, help="M5 版本固定 115200")
+    ap.add_argument("--loops", type=int, default=7, help="循环次数，默认 7")
+    ap.add_argument("--dry-run", action="store_true", help="只验证依赖导入，不打开串口")
+    ap.add_argument("--yes", action="store_true", help="跳过交互确认")
+    args = ap.parse_args()
+
+    print("依赖来源:", bootstrap.SOURCE)
+    print("MyCobot280 导入成功")
+    if args.dry_run:
+        print("[dry-run] 未连接硬件，退出。")
+        return 0
+
+    if not args.port:
+        print("请指定 --port，例如 --port COM3。串口列表：python check_env.py")
+        return 2
+
+    print("即将连接 {} @ {}，Basic 屏需处于 Transponder 且显示 Atom: OK".format(args.port, args.baud))
+    if not args.yes:
+        try:
+            if input("输入 y 继续: ").strip().lower() != "y":
+                print("已取消")
+                return 0
+        except EOFError:
+            print("非交互环境，请追加 --yes")
+            return 2
+
+    mc = MyCobot280(args.port, args.baud)
+    i = args.loops
+    while i > 0:
+        mc.set_color(0, 0, 255)   # 蓝
+        time.sleep(2)
+        mc.set_color(255, 0, 0)   # 红
+        time.sleep(2)
+        mc.set_color(0, 255, 0)   # 绿
+        time.sleep(2)
+        i -= 1
+    print("完成 {} 轮闪烁".format(args.loops))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

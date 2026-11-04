@@ -1,0 +1,19 @@
+# Python / 虚拟环境
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# 本机临时脚本、wheel 与日志（不上传）
+.wheels/
+
+# WorkBuddy 工作区数据（含会话记忆，私有）
+.workbuddy/
+
+# 编辑器 / 系统
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

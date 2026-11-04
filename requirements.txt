@@ -1,0 +1,4 @@
+# myCobot 280 M5 (2023) 官方文档配套的固定版本
+# 安装：pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+pymycobot==3.9.9
+pyserial==3.5
