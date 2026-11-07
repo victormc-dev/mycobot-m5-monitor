@@ -1,7 +1,7 @@
 # coding=utf-8
 """运动示例：回零 + J1 左右摆动 + 回零（会实际动作，谨慎使用）。
 
-前置：底座已固定、机械臂运动范围内无障碍物、12V 电源已接、Transponder 已开启。
+前置：底座已固定、机械臂运动范围内无障碍物、电源已接（280 为 12V / 320 为 24V）、串口转发就绪。
 
     python examples\\03_gohome.py --port COM3 --yes
 """
@@ -13,13 +13,15 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import bootstrap  # noqa: E402
-from pymycobot.mycobot280 import MyCobot280  # noqa: E402
+import robot_profiles as profiles  # noqa: E402  新增：280 / 320 型号适配层
 
 ZERO = [0, 0, 0, 0, 0, 0]
 
 
 def main():
-    ap = argparse.ArgumentParser(description="myCobot 280 M5 回零与单关节摆动")
+    ap = argparse.ArgumentParser(description="myCobot 280 / 320 M5 回零与单关节摆动")
+    ap.add_argument("--model", default=profiles.DEFAULT_MODEL, choices=profiles.model_keys(),
+                    help="机械臂型号，默认 280；320 为新增适配")
     ap.add_argument("--port", default="", help="串口号，如 COM3")
     ap.add_argument("--baud", type=int, default=115200)
     ap.add_argument("--speed", type=int, default=20, help="运动速度 0-100，默认 20")
@@ -31,6 +33,8 @@ def main():
         print("请指定 --port；串口列表：python check_env.py")
         return 2
 
+    prof = profiles.get_profile(args.model)
+    print("型号:", profiles.summary(prof))
     print("[注意] 机械臂即将运动。请确认底座已固定、周围无障碍、供电正常。")
     if not args.yes:
         try:
@@ -41,7 +45,11 @@ def main():
             print("非交互环境，请追加 --yes")
             return 2
 
-    mc = MyCobot280(args.port, args.baud)
+    ok, msg = profiles.driver_available(prof)
+    if not ok:
+        print("驱动不可用:", msg)
+        return 1
+    mc = profiles.create_robot(prof, args.port, args.baud)
     print("回零 ...")
     mc.send_angles(ZERO, args.speed)
     time.sleep(3)

@@ -5,8 +5,11 @@
     .venv\\Scripts\\python.exe joint_monitor.py                # 启动界面（自动演示）
     .venv\\Scripts\\python.exe joint_monitor.py --demo          # 强制演示模式
     .venv\\Scripts\\python.exe joint_monitor.py --selftest      # 无界面自检
+    .venv\\Scripts\\python.exe joint_monitor.py --model 320     # 新增：适配 myCobot 320 M5
 
-真机模式通过 pymycobot.MyCobot280 读取 get_angles() / get_coords()；
+真机模式按型号通过 robot_profiles 工厂创建驱动（280 → MyCobot280，
+320 → MyCobot320）读取 get_angles() / get_coords()；默认型号仍为 280 M5。
+型号参数、关节限位与界面文案集中在 robot_profiles.py，详见 README_320.md。
 演示模式内置四种动作预设，无需硬件即可查看六轴联动动画。
 
 姿态视图用纯 Python 3x3 旋转矩阵构造六自由度串联运动链，正交投影到
@@ -29,8 +32,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import bootstrap  # noqa: E402  依赖引导（venv 优先，回退 vendor）
+import robot_profiles as profiles  # noqa: E402  新增：280 / 320 型号适配层
 
-from pymycobot.mycobot280 import MyCobot280  # noqa: E402
+from pymycobot.mycobot280 import MyCobot280  # noqa: E402  保留原默认驱动导入
 from serial.tools import list_ports  # noqa: E402
 
 import tkinter as tk  # noqa: E402
@@ -151,15 +155,20 @@ def ortho_basis(axis):
     return v, w
 
 
-def build_arm(angles):
-    """按 J1..J6 顺序构造串联运动链，返回全部 3D 图元所需数据。"""
+def build_arm(angles, geom=None):
+    """按 J1..J6 顺序构造串联运动链，返回全部 3D 图元所需数据。
+
+    geom 为 (base_h, link_len, grid_extent)，由 profiles.scale_geometry() 生成；
+    传 None 时沿用 280 M5 的原始可视化尺寸（完全兼容适配前行为）。
+    """
     a = [float(x) for x in angles[:6]]
+    base_h, link_len, grid_extent = geom if geom is not None else (BASE_H, LINK_LEN, 96.0)
     segments = []      # (p0, p1, joint_index)  joint_index=0 为固定基座立柱
     joints = []        # (center, axis_vector, joint_index)
     frames = []        # 每个关节旋转后的局部坐标系
 
     p = [0.0, 0.0, 0.0]
-    top = [0.0, 0.0, BASE_H]
+    top = [0.0, 0.0, base_h]
     segments.append((p, top, 0))
     p = top
 
@@ -176,7 +185,7 @@ def build_arm(angles):
         joints.append((p, m3col(R, col), k))
         R = m3mul(R, rot_of[which](a[k]))
         frames.append(R)
-        nxt = vadd(p, m3col(R, 2), LINK_LEN[k - 1])
+        nxt = vadd(p, m3col(R, 2), link_len[k - 1])
         segments.append((p, nxt, k))
         p = nxt
 
@@ -194,6 +203,8 @@ def build_arm(angles):
         "segments": segments,
         "joints": joints,
         "tip": p,
+        "base_h": base_h,
+        "grid_extent": grid_extent,
         "frame": R,
         "base_pointer": base_pointer,
         "cross_bar": cross_bar,
@@ -227,8 +238,9 @@ def pose_points(arm):
         pts.append(tip)
     pts.append(arm["base_pointer"])
     pts.append(arm["tip"])
-    for x in (-96.0, 96.0):
-        for y in (-96.0, 96.0):
+    g = arm.get("grid_extent", 96.0)
+    for x in (-g, g):
+        for y in (-g, g):
             pts.append([x, y, 0.0])
     return pts
 
@@ -252,11 +264,12 @@ def lerp_angles(cur, tgt, factor=0.22):
 class AngleSource:
     """统一真机 / 演示两种数据源。"""
 
-    def __init__(self, port, baud, demo, preset=DEMO_PRESETS[0]):
+    def __init__(self, port, baud, demo, preset=DEMO_PRESETS[0], profile=None):
         self.port = port
         self.baud = baud
         self.demo = demo
         self.preset = preset
+        self.profile = profile or profiles.get_profile(profiles.DEFAULT_MODEL)
         self.mc = None
         self._n = 0
         self._coords = None
@@ -267,7 +280,7 @@ class AngleSource:
             return
         if not self.port:
             raise ValueError("未选择串口，请先点击「刷新」扫描端口")
-        self.mc = MyCobot280(self.port, self.baud)
+        self.mc = profiles.create_robot(self.profile, self.port, self.baud)
 
     @staticmethod
     def demo_angles(t, preset):
@@ -371,9 +384,10 @@ class Reader(threading.Thread):
 
 # ---------------------------------------------------------------- 界面
 class MonitorApp(tk.Tk):
-    def __init__(self, force_demo=False):
+    def __init__(self, force_demo=False, model=profiles.DEFAULT_MODEL):
         super().__init__()
-        self.title("myCobot 280 M5  六关节角度实时监控 / 六轴姿态动画")
+        self.profile = profiles.get_profile(model)
+        self.title(self.profile.label + "  六关节角度实时监控 / 六轴姿态动画")
         # 初始几何按屏幕工作区自适应，且不超过设计尺寸
         sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
         w = max(760, min(DESIGN_W, int(sw * 0.94), sw - 40))
@@ -492,9 +506,10 @@ class MonitorApp(tk.Tk):
         self.left_frame = left
         tk.Label(left, text="六关节角度  ( 单位: 度 )", bg=CARD, fg=TEXT,
                  font=FONT_UI_B).pack(anchor="w", padx=14, pady=(12, 2))
-        tk.Label(left, text="显示量程 ±180；实际限位以设备参数为准", bg=CARD, fg=MUTED,
-                 font=FONT_SMALL, justify="left", anchor="w", wraplength=200).pack(
-            anchor="w", padx=14, pady=(0, 6))
+        self.limit_caption = tk.Label(
+            left, text=self.profile.limit_caption or "显示量程 ±180；实际限位以设备参数为准",
+            bg=CARD, fg=MUTED, font=FONT_SMALL, justify="left", anchor="w", wraplength=200)
+        self.limit_caption.pack(anchor="w", padx=14, pady=(0, 6))
 
         self.value_labels = []
         self.bar_canvases = []
@@ -515,7 +530,7 @@ class MonitorApp(tk.Tk):
                  text="六轴姿态动画说明").pack(anchor="w", padx=14, pady=(20, 4))
         self.tip_label = tk.Label(left, bg=CARD, fg=MUTED, font=FONT_SMALL,
                                   justify="left", anchor="w", wraplength=200,
-                                  text=TIP_FULL)
+                                  text=self.profile.tip_full or TIP_FULL)
         self.tip_label.pack(anchor="w", padx=14, pady=(0, 12))
         tk.Frame(left, bg=CARD).pack(fill="both", expand=True)   # 多余高度留白
 
@@ -594,6 +609,16 @@ class MonitorApp(tk.Tk):
                                   font=FONT_SMALL)
         self.src_label.pack(side="right", padx=12)
 
+        # 新增：型号切换放在状态栏，不影响原有单行工具栏布局
+        tk.Label(bar, text="型号", bg=CARD, fg=MUTED, font=FONT_SMALL).pack(
+            side="right", padx=(0, 4))
+        self.model_var = tk.StringVar(value=self.profile.key)
+        self.model_box = ttk.Combobox(bar, textvariable=self.model_var, width=6,
+                                      state="readonly", font=FONT_SMALL,
+                                      values=profiles.model_keys())
+        self.model_box.pack(side="right", padx=(0, 8))
+        self.model_box.bind("<<ComboboxSelected>>", self._on_model_change)
+
     # ---- 尺寸自适应
     def _on_host_configure(self, evt):
         """3D 演示独占纵列并铺满主区高度；窗口过矮时保持自然高度并启用滚动。"""
@@ -606,7 +631,9 @@ class MonitorApp(tk.Tk):
         compact = (evt.height < 620) or (self.left_frame.winfo_width() < 320)
         if compact != self._tip_compact:
             self._tip_compact = compact
-            self.tip_label.configure(text=TIP_SHORT if compact else TIP_FULL)
+            self.tip_label.configure(
+                text=(self.profile.tip_short or TIP_SHORT) if compact
+                else (self.profile.tip_full or TIP_FULL))
         need_h = max(BODY_MIN_H, POSE_CHROME + h_pose, RIGHT_CHROME + h_trend,
                      LEFT_REQ_SHORT if compact else LEFT_REQ_FULL)
         h = max(evt.height, need_h)
@@ -637,7 +664,8 @@ class MonitorApp(tk.Tk):
         self._draw_trend()
         if self.frames > 0:
             for i, cv in enumerate(self.bar_canvases):
-                self._draw_bar(cv, self.last_angles[i], JOINT_COLORS[i])
+                self._draw_bar(cv, self.last_angles[i], JOINT_COLORS[i],
+                               self.profile.display_limit)
         self._draw_pose(self.pose_angles, self.active_joint)
         self._fit_snap = False
 
@@ -679,6 +707,36 @@ class MonitorApp(tk.Tk):
             self.reader.source.preset = self.preset_var.get()
         self._set_status("演示动作切换为：" + self.preset_var.get())
 
+    def _on_model_change(self, _evt=None):
+        """新增：切换 280 / 320 型号；采集中禁止切换以免驱动与参数错配。"""
+        key = self.model_var.get()
+        if self.running:
+            self.model_var.set(self.profile.key)
+            self._set_status("采集中不能切换型号，请先点击「停止采集」")
+            return
+        try:
+            prof = profiles.get_profile(key)
+        except ValueError as exc:
+            self.model_var.set(self.profile.key)
+            self._set_status(str(exc))
+            return
+        self.profile = prof
+        self.title(prof.label + "  六关节角度实时监控 / 六轴姿态动画")
+        self.limit_caption.configure(
+            text=prof.limit_caption or "显示量程 ±180；实际限位以设备参数为准")
+        self.tip_label.configure(
+            text=(prof.tip_short or TIP_SHORT) if self._tip_compact
+            else (prof.tip_full or TIP_FULL))
+        self.baud_var.set(str(prof.baud))
+        self._fit_snap = True
+        self._draw_pose(self.pose_angles, self.active_joint)
+        self._draw_trend()
+        if self.frames > 0:
+            for i, cv in enumerate(self.bar_canvases):
+                self._draw_bar(cv, self.last_angles[i], JOINT_COLORS[i], prof.display_limit)
+        self._fit_snap = False
+        self._set_status("型号已切换：{} | {}".format(prof.label, profiles.summary(prof)))
+
     def _toggle_run(self):
         if self.running:
             self._stop()
@@ -693,7 +751,8 @@ class MonitorApp(tk.Tk):
             self._set_status("波特率必须是数字")
             return
         interval = int(str(self.interval_var.get()).split()[0])
-        src = AngleSource("" if demo else self.port_var.get(), baud, demo, self.preset_var.get())
+        src = AngleSource("" if demo else self.port_var.get(), baud, demo,
+                          self.preset_var.get(), profile=self.profile)
         self.reader = Reader(src, interval, self.q)
         self.running = True
         self.frames = 0
@@ -768,7 +827,9 @@ class MonitorApp(tk.Tk):
         self.frames += 1
         self.active_joint = active
         if angles is None:
-            self._set_status("警告: 机械臂无响应（检查 Transponder / 供电 / 波特率）")
+            self._set_status("警告: 机械臂无响应（检查 {} / 供电 / {} 波特率）".format(
+                "串口转发" if self.profile.key == "320" else "Transponder",
+                self.profile.baud))
             return
         self.target_angles = list(angles)
         self.history.append(angles)
@@ -777,7 +838,8 @@ class MonitorApp(tk.Tk):
 
         for i, val in enumerate(angles):
             self.value_labels[i].config(text="{:+.2f}".format(val))
-            self._draw_bar(self.bar_canvases[i], val, JOINT_COLORS[i])
+            self._draw_bar(self.bar_canvases[i], val, JOINT_COLORS[i],
+                           self.profile.display_limit)
         self._draw_trend()
         # 3D 姿态由 _animate 以 ~30 FPS 插值绘制，此处不直接重绘
 
@@ -789,12 +851,15 @@ class MonitorApp(tk.Tk):
                     lab.config(text="--")
         mode = "演示" if self.demo_var.get() else "真机 " + self.port_var.get()
         extra = " | 演示 J{}".format(active + 1) if active >= 0 else ""
-        self._set_status("{} | {} | 采样 {} | 帧 {} | 读取 {:.1f} ms{}".format(
-            mode, self.preset_var.get(), self.interval_var.get(), self.frames, elapsed_ms, extra))
+        over = profiles.over_limit(self.profile, angles)
+        warn = " | 超限位 J{}".format(",".join(str(j) for j in over)) if over else ""
+        self._set_status("{} | {} | 采样 {} | 帧 {} | 读取 {:.1f} ms{}{}".format(
+            mode, self.preset_var.get(), self.interval_var.get(), self.frames,
+            elapsed_ms, extra, warn))
 
     # ---- 2D 绘图
     @staticmethod
-    def _draw_bar(c, value, color):
+    def _draw_bar(c, value, color, limit=LIMIT):
         c.delete("all")
         w = c.winfo_width()
         h = c.winfo_height()
@@ -804,7 +869,7 @@ class MonitorApp(tk.Tk):
             h = BAR_H
         c.create_rectangle(0, 0, w, h, fill=TRACK, outline="")
         mid = w / 2
-        frac = max(-1.0, min(1.0, value / LIMIT))
+        frac = max(-1.0, min(1.0, value / limit))
         x = mid + frac * (mid - 3)
         x0, x1 = (mid, x) if x >= mid else (x, mid)
         if x1 - x0 > 0.5:
@@ -823,18 +888,20 @@ class MonitorApp(tk.Tk):
         plot_h = max(20, h - pad_t - pad_b)
         plot_w = max(20, w - pad_l - pad_r)
 
+        lim = self.profile.display_limit
+
         def y_of(v):
-            frac = max(-1.0, min(1.0, v / LIMIT))
+            frac = max(-1.0, min(1.0, v / lim))
             return pad_t + (1.0 - frac) / 2.0 * plot_h
 
         # 网格密度随画布高度自适应，拉高后不会中间空荡
         n_grid = 9 if h >= 320 else (7 if h >= 200 else 5)
         for i in range(n_grid):
-            v = LIMIT - 2.0 * LIMIT * i / (n_grid - 1)
+            v = lim - 2.0 * lim * i / (n_grid - 1)
             y = y_of(v)
             c.create_line(pad_l, y, w - pad_r, y, fill=GRID)
         c.create_line(pad_l, y_of(0.0), w - pad_r, y_of(0.0), fill="#C7CDD6", width=1.4)
-        for v in (180.0, 90.0, 0.0, -90.0, -180.0):
+        for v in (lim, lim / 2.0, 0.0, -lim / 2.0, -lim):
             c.create_text(pad_l - 5, y_of(v), anchor="e", fill=MUTED, font=FONT_TINY,
                           text=("{:+d}".format(int(v)) if v else "0"))
         c.create_text(pad_l, h - 8, anchor="w", fill=MUTED, font=FONT_TINY,
@@ -885,7 +952,8 @@ class MonitorApp(tk.Tk):
         if H < 40:
             H = POSE_H
         az, el = self.view_az, self.view_el
-        arm = build_arm(a)
+        geom = profiles.scale_geometry(BASE_H, LINK_LEN, 96.0, self.profile.geom_scale)
+        arm = build_arm(a, geom)
         sc, ox, oy = self._fit_pose(arm, W, H, az, el)
         self._last_pose_transform = (sc, ox, oy)
         self._last_pose_size = (W, H)
@@ -918,15 +986,16 @@ class MonitorApp(tk.Tk):
                           c.create_oval(s[0] - r, s[1] - r, s[0] + r, s[1] + r,
                                         fill=fill, outline=outline, width=width)))
 
-        # 地面参考网格：J1 回转时提供静止参照
+        # 地面参考网格：J1 回转时提供静止参照；尺寸随型号工作半径缩放
+        g = arm["grid_extent"]
         for k in range(-2, 3):
-            t = k * 46.0
-            add_line([t, -96.0, 0.0], [t, 96.0, 0.0], FLOOR, 1)
-            add_line([-96.0, t, 0.0], [96.0, t, 0.0], FLOOR, 1)
+            t = k * g * 46.0 / 96.0
+            add_line([t, -g, 0.0], [t, g, 0.0], FLOOR, 1)
+            add_line([-g, t, 0.0], [g, t, 0.0], FLOOR, 1)
 
         # 底座 + 随 J1 旋转的指针
         add_dot([0, 0, 0], 30, "#CBD5E1", "#94A3B8", 1)
-        add_line([0, 0, 0], [0, 0, BASE_H], "#94A3B8", 12)
+        add_line([0, 0, 0], [0, 0, arm["base_h"]], "#94A3B8", 12)
         add_line([0, 0, 6.0], arm["base_pointer"], JOINT_COLORS[0], 3)
 
         # 六段连杆（外描边 + 内芯，形成柱体观感）
@@ -1054,6 +1123,24 @@ def selftest():
 
     print("POSE3D_OK segments=6 joints=6 orthogonal=True projection=True")
     print("IMPORT_OK MyCobot280 / pyserial / tkinter")
+
+    # 新增：320 M5 适配层自检（纯软件，不打开串口）
+    p320 = profiles.get_profile("320")
+    ok320, msg320 = profiles.driver_available(p320)
+    assert ok320, "320 驱动不可用: {}".format(msg320)
+    geo320 = profiles.scale_geometry(BASE_H, LINK_LEN, 96.0, p320.geom_scale)
+    arm320 = build_arm([12.5, -30.0, 65.0, -35.0, 40.0, 80.0], geo320)
+    assert abs(arm320["grid_extent"] - 120.0) < 1e-9, "320 工作半径比例应为 1.25"
+    assert abs(arm320["base_h"] - BASE_H * 1.25) < 1e-9, "320 基座高度未按比例缩放"
+    assert len(arm320["segments"]) == 6 and len(arm320["joints"]) == 6
+    assert all(math.isfinite(x) for p0, p1, _ in arm320["segments"]
+               for v in (p0, p1) for x in v), "320 3D 点非有限值"
+    assert profiles.over_limit(p320, [0, 0, 0, 0, 0, 0]) == []
+    assert profiles.over_limit(p320, [170, 0, 0, 0, 0, 0]) == [1]
+    assert profiles.over_limit(profiles.get_profile(profiles.DEFAULT_MODEL),
+                               [179, 0, 0, 0, 0, 0]) == []
+    print("PROFILE_OK keys={} 320_driver={} geom_scale={} limits_ok=True".format(
+        profiles.model_keys(), p320.driver_class, p320.geom_scale))
     print("SELFTEST_OK")
 
 
@@ -1172,7 +1259,9 @@ def pose_test():
 
 
 def main():
-    ap = argparse.ArgumentParser(description="myCobot 280 M5 六关节实时监控与六轴姿态动画")
+    ap = argparse.ArgumentParser(description="myCobot 280 / 320 M5 六关节实时监控与六轴姿态动画")
+    ap.add_argument("--model", default=profiles.DEFAULT_MODEL, choices=profiles.model_keys(),
+                    help="机械臂型号，默认 280（原有行为）；320 为新增适配")
     ap.add_argument("--demo", action="store_true", help="启动即进入演示模式并自动开始动画")
     ap.add_argument("--selftest", action="store_true", help="无界面自检并退出")
     ap.add_argument("--pose-test", action="store_true", help="创建窗口验证 3D 绘制后退出")
@@ -1183,7 +1272,7 @@ def main():
     if args.pose_test:
         pose_test()
         return 0
-    app = MonitorApp(force_demo=args.demo)
+    app = MonitorApp(force_demo=args.demo, model=args.model)
     app.mainloop()
     return 0
 

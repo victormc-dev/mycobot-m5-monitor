@@ -5,6 +5,7 @@
     python check_env.py                      # 只检查软件环境 + 扫描串口
     python check_env.py --port COM3          # 追加联机只读测试
     python check_env.py --port COM3 --baud 115200
+    python check_env.py --model 320            # 新增：按 320 M5 规格自检
 """
 
 import argparse
@@ -16,6 +17,7 @@ from pathlib import Path
 # 重定向到文件/管道时则跟随系统 ANSI(cp936)，两种场景中文都能正常显示。
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import bootstrap  # noqa: E402
+import robot_profiles as profiles  # noqa: E402  新增：280 / 320 型号适配层
 
 
 def show(key, value):
@@ -23,13 +25,16 @@ def show(key, value):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="myCobot 280 M5 环境自检")
+    ap = argparse.ArgumentParser(description="myCobot 280 / 320 M5 环境自检")
+    ap.add_argument("--model", default=profiles.DEFAULT_MODEL, choices=profiles.model_keys(),
+                    help="机械臂型号，默认 280（原有行为）；320 为新增适配")
     ap.add_argument("--port", default="", help="串口号，如 COM3 / /dev/ttyUSB0")
     ap.add_argument("--baud", type=int, default=115200, help="波特率，M5 固定 115200")
     args = ap.parse_args()
+    prof = profiles.get_profile(args.model)
 
     print("=" * 62)
-    print("myCobot 280 M5  本地运行环境自检")
+    print(prof.label + "  本地运行环境自检")
     print("=" * 62)
 
     print("[1] Python")
@@ -49,6 +54,12 @@ def main():
         show("pymycobot", pymycobot.__version__)
         show("pyserial", serial.VERSION)
         show("MyCobot280", "OK")
+        # 新增：逐型号检查驱动类是否可导入（不打开串口）
+        for key in profiles.model_keys():
+            ok, msg = profiles.driver_available(profiles.get_profile(key))
+            show("驱动 " + key, msg)
+            if not ok and key == prof.key:
+                raise RuntimeError(msg)
     except Exception as exc:
         ok = False
         show("ERROR", "{}: {}".format(type(exc).__name__, exc))
@@ -59,7 +70,8 @@ def main():
     ports = list(list_ports.comports())
     if not ports:
         show("结果", "未发现串口设备")
-        print("       -> 检查 12V 电源、Type-C 数据线、CP210X/CP34X 驱动")
+        print("       -> 检查 {}、Type-C 数据线、CP210X/CP34X 驱动".format(
+            "24V 电源" if prof.key == "320" else "12V 电源"))
     for p in ports:
         desc = (p.description or "").upper()
         chip = ""
@@ -70,14 +82,17 @@ def main():
         show(p.device, "{} {}".format(p.description or "-", chip))
 
     print("[4] 硬件状态提醒")
+    show("型号规格", profiles.summary(prof))
     show("波特率", str(args.baud) + "  (M5 版本必须为 115200)")
-    show("供电", "12V / 3-5A / DC 5.5x2.1，不能只靠 Type-C")
-    show("Basic 屏", "Transponder 功能，按 A 显示 Atom: OK")
+    show("供电", prof.power)
+    show("Basic 屏", "按官方首次使用流程烧录固件并确认串口转发就绪"
+         if prof.key == "320" else "Transponder 功能，按 A 显示 Atom: OK")
 
     if args.port:
         print("[5] 联机只读测试  {}".format(args.port))
         try:
-            mc = MyCobot280(args.port, args.baud)
+            mc = profiles.create_robot(prof, args.port, args.baud)
+            show("驱动实例", prof.driver_class)
             angles = mc.get_angles()
             coords = mc.get_coords()
             show("关节角", angles)

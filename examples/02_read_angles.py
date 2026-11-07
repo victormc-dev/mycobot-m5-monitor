@@ -11,11 +11,13 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import bootstrap  # noqa: E402
-from pymycobot.mycobot280 import MyCobot280  # noqa: E402
+import robot_profiles as profiles  # noqa: E402  新增：280 / 320 型号适配层
 
 
 def main():
-    ap = argparse.ArgumentParser(description="读取 myCobot 280 M5 关节角 / 坐标")
+    ap = argparse.ArgumentParser(description="读取 myCobot 280 / 320 M5 关节角 / 坐标")
+    ap.add_argument("--model", default=profiles.DEFAULT_MODEL, choices=profiles.model_keys(),
+                    help="机械臂型号，默认 280；320 为新增适配")
     ap.add_argument("--port", default="", help="串口号，如 COM3")
     ap.add_argument("--baud", type=int, default=115200)
     ap.add_argument("--count", type=int, default=3, help="采样次数，默认 3")
@@ -26,7 +28,13 @@ def main():
         print("请指定 --port；串口列表：python check_env.py")
         return 2
 
-    mc = MyCobot280(args.port, args.baud)
+    prof = profiles.get_profile(args.model)
+    print("型号:", profiles.summary(prof))
+    ok, msg = profiles.driver_available(prof)
+    if not ok:
+        print("驱动不可用:", msg)
+        return 1
+    mc = profiles.create_robot(prof, args.port, args.baud)
     for i in range(args.count):
         angles = mc.get_angles()
         coords = mc.get_coords()
