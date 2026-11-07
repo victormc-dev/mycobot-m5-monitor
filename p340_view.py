@@ -46,16 +46,55 @@ HISTORY = 120
 L1, L2 = 110.0, 95.0        # 平面姿态示意连杆长度（可视化，非真实 mm）
 BASE_H = 26.0
 
+# 与主界面「动作」下拉一致，四个预设全部提供 P340 四轴版
+DEMO_PRESETS = ("自由摆动", "逐关节演示", "抓取循环", "归零静止")
+
+
+def demo_angles(t, preset=DEMO_PRESETS[0], n=3):
+    """四种演示预设的 P340 版本，3 / 4 轴通用，角度均落在官方限位内。
+
+    返回 (angles, active_joint)；active_joint 供「逐关节演示」高亮。
+    """
+    n = max(3, min(4, int(n)))
+    if preset == "归零静止":
+        return [0.0] * n, -1
+    if preset == "逐关节演示":
+        slot = int(t / 2.5)
+        idx = slot % n
+        phase = (t - slot * 2.5) / 2.5
+        base = [0.0, 35.0, 35.0, 0.0][:n]
+        amp = [80.0, 40.0, 30.0, 90.0][:n]
+        base[idx] += amp[idx] * math.sin(2.0 * math.pi * phase)
+        return [round(x, 2) for x in base], idx
+    if preset == "抓取循环":
+        w = 2.0 * math.pi * (t % 8.0) / 8.0
+        vals = [
+            60.0 * math.sin(w),
+            35.0 + 30.0 * math.cos(w),
+            35.0 + 25.0 * math.sin(w + 0.6),
+            70.0 * math.sin(2.0 * w),
+        ]
+        return [round(x, 2) for x in vals[:n]], -1
+    # 自由摆动（默认）
+    vals = [
+        80.0 * math.sin(0.40 * t),
+        35.0 + 40.0 * math.sin(0.55 * t + 0.7),
+        35.0 + 30.0 * math.sin(0.70 * t + 1.4),
+        90.0 * math.sin(0.60 * t + 2.1),
+    ]
+    return [round(x, 2) for x in vals[:n]], -1
+
 
 class _P340Source:
     """P340 真机 / 演示数据源。真机走官方 G-code 文本协议读数接口。"""
 
-    def __init__(self, profile, port, baud, demo, axis_mode_getter):
+    def __init__(self, profile, port, baud, demo, axis_mode_getter, preset_getter=None):
         self.profile = profile
         self.port = port
         self.baud = baud
         self.demo = demo
         self.axis_mode_getter = axis_mode_getter
+        self.preset_getter = preset_getter or (lambda: DEMO_PRESETS[0])
         self.robot = None
         self._n = 0
         self._coords = None
@@ -67,22 +106,11 @@ class _P340Source:
             raise ValueError("未选择串口，请先点击「刷新」扫描端口")
         self.robot = profiles.create_robot(self.profile, self.port, self.baud)
 
-    @staticmethod
-    def demo_angles(t, n):
-        """在官方限位内生成演示角度：J1 ±80 / J2 -5~75 / J3 5~65 / J4 ±90。"""
-        vals = [
-            80.0 * math.sin(0.40 * t),
-            35.0 + 40.0 * math.sin(0.55 * t + 0.7),
-            35.0 + 30.0 * math.sin(0.70 * t + 1.4),
-            90.0 * math.sin(0.60 * t + 2.1),
-        ]
-        return [round(x, 2) for x in vals[:n]], -1
-
     def read(self):
         t0 = time.perf_counter()
         n = self.axis_mode_getter()
         if self.demo:
-            angles, active = self.demo_angles(time.monotonic(), n)
+            angles, active = demo_angles(time.monotonic(), self.preset_getter(), n)
             ms = (time.perf_counter() - t0) * 1000.0
             return angles, None, ms, active
 
@@ -115,6 +143,8 @@ class P340Panel(tk.Frame):
         self.on_status = on_status or (lambda _text: None)
         self.axis_var = tk.IntVar(value=self.profile.dof)   # 3 / 4 轴
         self._axis_n = self.profile.dof                    # 采集线程读取，避免跨线程访问 tk 变量
+        self._preset = DEMO_PRESETS[0]                     # 采集线程读取当前演示预设
+        self._resize_job = None
         self.q = queue.Queue()
         self.thread = None
         self.stop_evt = threading.Event()
@@ -159,7 +189,7 @@ class P340Panel(tk.Frame):
         # 左：关节角度 / 限位条
         left = tk.Frame(body, bg=CARD, highlightthickness=1, highlightbackground=GRID)
         left.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
-        tk.Label(left, text="关节角度（按各自官方限位归一）", bg=CARD, fg=TEXT,
+        tk.Label(left, text="关节角度（0 居中，左右按各自限位）", bg=CARD, fg=TEXT,
                  font=FONT_UI_B).pack(anchor="w", padx=12, pady=(12, 2))
         tk.Label(left, text="3 轴为常规配置；第 4 轴选配", bg=CARD, fg=MUTED,
                  font=FONT_SMALL).pack(anchor="w", padx=12, pady=(0, 6))
@@ -230,6 +260,16 @@ class P340Panel(tk.Frame):
                            font=("Consolas", 10), width=9, anchor="e")
             lab.grid(row=i // 2, column=(i % 2) * 2 + 1, padx=(0, 8), pady=2, sticky="ew")
             self.coord_labels.append(lab)
+        self.bind("<Configure>", self._on_resize)
+
+    def _on_resize(self, _evt=None):
+        """尺寸变化后防抖重绘，保证 0 线始终落在画布中线。"""
+        if self._resize_job is not None:
+            try:
+                self.after_cancel(self._resize_job)
+            except Exception:
+                pass
+        self._resize_job = self.after(80, self._draw_all)
 
     # ---------------------------------------------------------------- 数据
     def _limits(self):
@@ -244,6 +284,13 @@ class P340Panel(tk.Frame):
             return lim[i]
         alt = self.profile.joint_limits_alt
         return alt[i] if alt and i < len(alt) else (-180.0, 180.0)
+
+    def set_preset(self, preset):
+        """主界面「动作」下拉切换时同步生效，采集过程中也可实时切换。"""
+        if preset not in DEMO_PRESETS:
+            return
+        self._preset = preset
+        self.on_status("P340 演示动作切换为：" + preset)
 
     def set_axis_mode(self):
         """3 轴 / 4 轴切换：官方标注自由度 3-4，第 4 轴为选配。"""
@@ -264,13 +311,15 @@ class P340Panel(tk.Frame):
         self._draw_all()
         self.on_status("P340 切换为 {} 轴模式".format(self.axis_var.get()))
 
-    def start(self, port="", baud=None, demo=True, interval_ms=200):
+    def start(self, port="", baud=None, demo=True, interval_ms=200,
+              preset=DEMO_PRESETS[0]):
         """由主程序「开始采集」按钮委托调用。"""
         if self.running:
             self.stop()
         self.port = port
         self.baud = self.profile.baud if baud is None else baud
         self.demo = demo
+        self._preset = preset if preset in DEMO_PRESETS else DEMO_PRESETS[0]
         self.interval = max(0.05, interval_ms / 1000.0)
         self.history = []
         self.frames = 0
@@ -278,11 +327,12 @@ class P340Panel(tk.Frame):
         self.running = True
         self.thread = threading.Thread(target=self._reader, daemon=True)
         self.thread.start()
-        self.on_status("P340 {}采集中...".format("演示模式 " if demo else "真机 "))
+        self.on_status("P340 {}· {} 采集中...".format(
+            "演示模式" if demo else "真机", self._preset))
 
     def _reader(self):
         src = _P340Source(self.profile, self.port, self.baud, self.demo,
-                          lambda: self._axis_n)
+                          lambda: self._axis_n, lambda: self._preset)
         try:
             src.open()
             self.q.put(("ready", None))
@@ -342,7 +392,8 @@ class P340Panel(tk.Frame):
             v = vals[i] if i < len(vals) else None
             self.last_angles[i] = 0.0 if v is None else v
             self.value_labels[i].configure(
-                text="{:+.2f}".format(v) if v is not None else "--.--")
+                text="{:+.2f}".format(v) if v is not None else "--.--",
+                fg=(JOINT_COLORS[i] if i == active else TEXT))
             lo, hi = self._limit_at(i)
             self._draw_bar(self.bar_canvases[i], v, lo, hi, JOINT_COLORS[i])
         self._draw_pose(self.last_angles)
@@ -357,26 +408,53 @@ class P340Panel(tk.Frame):
         over = profiles.over_limit(self.profile, vals, limits)
         warn = " | 超限位 J{}".format(",".join(str(j) for j in over)) if over else ""
         mode = "演示" if self.demo else "真机 " + (self.port or "-")
-        self.on_status("P340 | {} | 帧 {} | 读取 {:.1f} ms{}{}".format(
-            mode, self.frames, elapsed_ms,
+        self.on_status("P340 | {} | {} | 帧 {} | 读取 {:.1f} ms{}{}".format(
+            mode, self._preset if self.demo else "真机数据", self.frames, elapsed_ms,
             " | 演示 J{}".format(active + 1) if active >= 0 else "", warn))
 
     # ---------------------------------------------------------------- 绘图
     @staticmethod
     def _draw_bar(c, value, lo, hi, color):
+        """0 线固定在轨道中点；左半区映射 [lo,0]，右半区映射 [0,hi]。
+
+        与六轴主界面的 ±量程条保持同一视觉基准：正值向右、负值向左，
+        非对称限位只影响左右各自的刻度密度，不再把 0 线挤到一边。
+        """
         c.delete("all")
-        w = max(60, c.winfo_width())
-        h = max(12, c.winfo_height())
+        w = c.winfo_width()
+        if w < 20:
+            w = c.winfo_reqwidth()
+        w = max(120, w)
+        h = c.winfo_height()
+        if h < 8:
+            h = c.winfo_reqheight()
+        h = max(12, h)
         c.create_rectangle(0, 0, w, h, fill=TRACK, outline="")
         pad = 3
-        span = max(1.0, hi - lo)
-        x_of = lambda v: pad + (max(lo, min(hi, v)) - lo) / span * (w - 2 * pad)
-        zero = x_of(0.0) if lo <= 0 <= hi else pad
-        c.create_line(zero, 0, zero, h, fill="#AAB2BF")
-        if value is not None:
-            x = x_of(value)
-            c.create_rectangle(min(zero, x), 2, max(zero, x), h - 2, fill=color, outline="")
-            c.create_line(x, 0, x, h, fill=TEXT, width=1)
+        mid = w / 2.0
+        left_w = max(1.0, mid - pad)
+        right_w = max(1.0, w - pad - mid)
+        neg_span = max(1e-6, -lo) if lo < 0 else 1e-6
+        pos_span = max(1e-6, hi) if hi > 0 else 1e-6
+
+        def x_of(v):
+            if v >= 0:
+                return mid + min(v, pos_span) / pos_span * right_w
+            return mid - min(-v, neg_span) / neg_span * left_w
+
+        c.create_line(mid, 0, mid, h, fill="#8B95A5", width=1.5)   # 0 基准线
+        c.create_line(pad, 1, pad, h - 1, fill="#C7CDD6")
+        c.create_line(w - pad, 1, w - pad, h - 1, fill="#C7CDD6")
+        if value is None:
+            return
+        over = value < lo or value > hi
+        x = x_of(value)
+        c.create_rectangle(min(mid, x), 2, max(mid, x), h - 2,
+                           fill="#DC2626" if over else color, outline="")
+        c.create_line(x, 0, x, h, fill=TEXT, width=2)
+        if over:
+            c.create_text(w - pad - 4, h / 2.0, anchor="e", fill="#FFFFFF",
+                          font=FONT_TINY, text="超限")
 
     def _draw_trend(self):
         c = self.trend
@@ -475,4 +553,4 @@ class P340Panel(tk.Frame):
         self._draw_pose(self.last_angles)
 
 
-__all__ = ["P340Panel"]
+__all__ = ["P340Panel", "DEMO_PRESETS", "demo_angles"]

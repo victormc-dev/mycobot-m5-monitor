@@ -745,6 +745,12 @@ class MonitorApp(tk.Tk):
             self._set_status("真机模式：请确认 COM 口与 115200 波特率")
 
     def _on_preset_change(self, _evt=None):
+        if self.profile.key == "p340":
+            if self.p340_view is not None:
+                self.p340_view.set_preset(self.preset_var.get())
+            else:
+                self._set_status("演示动作切换为：" + self.preset_var.get())
+            return
         if self.reader is not None and self.running:
             self.reader.source.preset = self.preset_var.get()
         self._set_status("演示动作切换为：" + self.preset_var.get())
@@ -799,7 +805,8 @@ class MonitorApp(tk.Tk):
         if self.profile.key == "p340":
             if self.p340_view is None:
                 self._switch_view(self.profile)
-            self.p340_view.start("" if demo else self.port_var.get(), baud, demo, interval)
+            self.p340_view.start("" if demo else self.port_var.get(), baud, demo, interval,
+                                 preset=self.preset_var.get())
             self.running = True
             self.frames = 0
             self.history = []
@@ -1207,6 +1214,21 @@ def selftest():
     assert ok340, "P340 驱动不可用: {}".format(msg340)
     assert p340.angle_api == "get_angles_info" and p340.coords_api == "get_coords_info"
     assert p340.dof == 3 and p340.dof_options == (3, 4)
+
+    # 新增：四个演示预设在 3 / 4 轴下均合法、不越官方限位
+    import p340_view
+    assert tuple(p340_view.DEMO_PRESETS) == DEMO_PRESETS, "P340 预设与主动作下拉不一致"
+    for preset in DEMO_PRESETS:
+        for axes in (3, 4):
+            lim = p340.joint_limits_alt if axes == 4 else p340.joint_limits
+            for t in (0.0, 1.3, 2.6, 5.1, 8.7, 16.2):
+                vals, act = p340_view.demo_angles(t, preset, axes)
+                assert len(vals) == axes and all(math.isfinite(v) for v in vals)
+                assert -1 <= act < axes
+                assert not profiles.over_limit(p340, vals, lim), \
+                    "P340 预设 {} {} 轴越界: {}".format(preset, axes, vals)
+    print("P340_PRESET_OK presets={} axes=3/4 in_limits=True".format(len(DEMO_PRESETS)))
+
     assert profiles.over_limit(p340, [0, 100, 0]) == [2], "J2 超限未识别"
     assert profiles.over_limit(p340, [0, 0, 100]) == [3], "3 轴模式 J3 超限未识别"
     assert profiles.over_limit(p340, [0, 0, 100], p340.joint_limits_alt) == [], \
