@@ -4,7 +4,7 @@
 
 - **不带 `--model` 运行时，行为与适配前完全一致（280 M5）**；
 - 加 `--model 320` 或在界面右下角「型号」下拉切到 `320`，即按 320 M5 的驱动、限位、量程、几何比例与硬件提示运行；
-- 原 `README.md`、`requirements.txt`、`setup.ps1`、`start_monitor.cmd`、`vendor/` **均未改动**。
+- `README.md` 现已在开头新增双型号总览，**原 280 全文一字未改地保留为附录章节**；`requirements.txt`、`setup.ps1`、`start_monitor.cmd`、`vendor/` 未改动。
 
 ---
 
@@ -86,9 +86,9 @@
 - `check_env.py`：`--model`、逐型号驱动检查、按型号显示供电与固件提示
 - `examples/01_led_blink.py`、`02_read_angles.py`、`03_gohome.py`：`--model`、按型号创建驱动
 
-**未改动**：`README.md`、`requirements.txt`、`bootstrap.py`、`setup.ps1`、`run_via_task.ps1`、`start_monitor.cmd`、`vendor/`。
+**未改动**：`requirements.txt`、`bootstrap.py`、`setup.ps1`、`run_via_task.ps1`、`start_monitor.cmd`、`vendor/`（`README.md` 仅新增双型号总览，原 280 全文保留为附录）。
 
-回滚：`backup_280_original/` 直接覆盖，或 `git checkout -- joint_monitor.py check_env.py examples/`（本次改动尚未提交）。
+回滚：适配改动已提交为 `00a1a84`，280 原版快照见 tag `v1.0.0`。用 `git revert 00a1a84` 回退，或 `git checkout v1.0.0 -- joint_monitor.py check_env.py examples/` 恢复单文件；`backup_280_original/` 亦保留原件副本。
 
 ---
 

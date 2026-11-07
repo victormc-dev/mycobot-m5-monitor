@@ -1,3 +1,76 @@
+# myCobot M5 Monitor
+
+**myCobot M5 系列六关节角度实时监控 + 六轴 3D 姿态动画**。一套界面、一套代码，支持 **280 M5（默认）** 与 **320 M5（新增适配）** 双型号。
+
+> 仓库已由 `mycobot-280-m5-monitor` 更名为 **[mycobot-m5-monitor](https://github.com/victormc-dev/mycobot-m5-monitor)**。GitHub 自动重定向旧链接；已有本地克隆可执行
+> `git remote set-url origin https://github.com/victormc-dev/mycobot-m5-monitor.git`
+>
+> 适配前的 280 M5 原版已发布为 [v1.0.0 Release](https://github.com/victormc-dev/mycobot-m5-monitor/releases/tag/v1.0.0)（快照 commit `77866ac`）。
+
+---
+
+## 一、支持型号
+
+| 项目 | 280 M5（默认） | 320 M5（`--model 320`） |
+|---|---|---|
+| Python 驱动 | `MyCobot280` | `MyCobot320` |
+| 串口波特率 | 115200 | 115200 |
+| 工作半径 / 负载 | 280 mm / 原项目未声明 | 350 mm / 1 kg |
+| 供电 | 12V / 3–5A，DC 5.5×2.1 | **DC 24V**（官网 120W / 文档 9.2A，以适配器铭牌为准） |
+| 关节限位 | ±180 显示量程 | J1~J5 ±165°、J6 ±175°，超限提示 |
+| 3D 姿态连杆 | 原始尺寸 | ×1.25 等比缩放（几何示意，非精确 DH） |
+| 硬件流程 | Transponder / `Atom: OK` | 按官方 320 M5 首次使用流程确认串口转发 |
+
+**不带 `--model` 运行即为 280 M5**，行为与 v1.0.0 逐行比对一致；320 为增量适配，未改写原有实现。
+
+## 二、快速开始
+
+```bash
+# 环境自检（不接硬件即可运行）
+python check_env.py
+python check_env.py --model 320
+
+# 启动监控界面（右下角「型号」下拉也可随时切换）
+python joint_monitor.py
+python joint_monitor.py --model 320 --demo
+
+# 无界面自检：演示预设 / 运动学矩阵 / 320 适配层断言
+python joint_monitor.py --selftest
+
+# 示例（均支持 --model）
+python examples/01_led_blink.py --model 320 --dry-run
+python examples/02_read_angles.py --model 320 --port COM3
+```
+
+Windows 下把 `python` 换成 `.\.venv\Scripts\python.exe`；一键建环境仍用原文的 `setup.ps1`。离线模式直接 `python` 即可——`vendor/` 已解包 `pymycobot 3.9.9` + `pyserial 3.5`，且已内含 `mycobot320.py`，**320 适配零新增依赖**。
+
+## 三、文件与文档
+
+| 文件 | 说明 |
+|---|---|
+| `joint_monitor.py` | 主程序：三列界面、六轴 3D 姿态、角度条 / 趋势曲线、四种演示预设、自检 |
+| `robot_profiles.py` | **型号真源**：规格参数、驱动工厂、关节限位、几何缩放、界面文案 |
+| `check_env.py` | 依赖检查、串口扫描、可选联机只读测试 |
+| `examples/` | LED 闪烁 / 读取角度 / 回零摆动（带安全确认） |
+| `README_320.md` | **320 M5 适配说明**：参数对照、官方来源、边界与回滚 |
+| `backup_280_original/` | 适配前 5 个文件的原件备份 |
+| `vendor/` | 离线依赖（已含 `mycobot320.py`） |
+
+## 四、版本
+
+| 版本 | 内容 |
+|---|---|
+| `v1.0.0` | 280 M5 原版（适配前快照），已发布 Release |
+| `main` | 280 默认 + 320 增量适配，双型号并存 |
+
+---
+
+## 附录：myCobot 280 M5 原始环境文档（原文保留）
+
+以下为适配前 `README.md` 的**全文，一字未改**，供 280 M5 的驱动安装、固件烧录、myStudio 使用与排错查阅。其中「12V 供电 / Transponder / Atom 固件」等内容**仅适用于 280 M5**；320 M5 请以上文表格及 `README_320.md` 为准。
+
+---
+
 # myCobot 280 M5 本地运行环境
 
 依据官方文档 [myCobot 280 M5 中文文档](https://docs.elephantrobotics.com/docs/mycobot_280_m5_cn/) 搭建，重点是 **6.1.1 环境搭建**、**5.2 myStudio 软件使用说明**、**4. 首次安装**。
