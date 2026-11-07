@@ -69,6 +69,7 @@ python joint_monitor.py --selftest
 ```
 
 Windows 下把 `python` 换成 `.\.venv\Scripts\python.exe`。
+**macOS**：双击 `start_monitor.command`，或 `./start_monitor.command --model p340 --demo` 直接进四轴面板（首次先 `chmod +x start_monitor.command`）。
 
 **硬件前置**：接 12V 5A 电源 → USB/串口连接 → 按[官方 ultraArm 文档](https://docs.elephantrobotics.com/docs/ultraArm/)安装驱动、烧录固件。**P340 没有 Transponder / `Atom: OK` 流程，也不要用 320 的 24V 电源。**
 

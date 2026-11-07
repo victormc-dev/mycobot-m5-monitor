@@ -68,7 +68,9 @@
 .\.venv\Scripts\python.exe joint_monitor.py --selftest
 ```
 
-界面方式：启动后在**右下角状态栏**的「型号」下拉选择 `280` / `320`，标题、说明、量程、趋势刻度与 3D 几何会同步刷新。若正在采集，需先点「停止采集」。
+**macOS**：双击 `start_monitor.command`，或 `./start_monitor.command --model 320 --demo`；首次先 `chmod +x start_monitor.command`。脚本自动挑选 Python，缺 `.venv` 时回退 `vendor/` 离线依赖。
+
+界面方式：启动后在**左列「型号」选择卡**或**右下角状态栏**下拉选择 `280` / `320` / `p340`，标题、说明、量程、趋势刻度与视图会同步刷新（P340 切到四轴独立面板）。若正在采集，需先点「停止采集」。
 
 **320 M5 硬件前置**：接 DC 24V 电源 → Type-C 连接 M5Stack-Basic → 按[官方 320 M5 首次使用流程](https://docs.elephantrobotics.com/docs/mycobot_320_m5_cn/4-FirstInstallAndUse/4.2-M5/4.2_320_M5_firstUse.html)安装驱动、烧录固件并确认串口转发就绪 → 选 COM 口开始采集。
 

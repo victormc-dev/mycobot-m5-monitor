@@ -52,6 +52,18 @@ python examples/04_p340_read_angles.py --port COM3 --axes 4
 
 Windows 下把 `python` 换成 `.\.venv\Scripts\python.exe`；一键建环境仍用原文的 `setup.ps1`。离线模式直接 `python` 即可——`vendor/` 已解包 `pymycobot 3.9.9` + `pyserial 3.5`，内含 `mycobot320.py` 与 `ultraArmP340.py`，**320 / P340 适配均零新增依赖**。前三个示例依赖六轴 API，不适用于 P340。
 
+**macOS 一键启动**：双击 `start_monitor.command` 即可在「终端」启动界面（首次先执行 `chmod +x start_monitor.command`）。脚本自动挑选 Python（`.venv` → PATH → Homebrew/系统 → WorkBuddy 内置），没有 `.venv` 时由 `bootstrap.py` 回退到 `vendor/` 离线依赖，**零配置**；型号默认 280，启动后在界面左列「型号」选择卡随时切换。
+
+```bash
+./start_monitor.command                       # 双击等同
+./start_monitor.command --model p340 --demo   # 直接进 P340 四轴面板
+./start_monitor.command --check --model 320   # 只跑环境自检
+./start_monitor.command --setup               # 一次性建 .venv（清华镜像）
+./start_monitor.command --dry-run             # 只打印将执行的命令
+```
+
+> 运行失败时终端会保留错误信息并等待回车；`--check` / `--setup` 不需要图形界面。
+
 ## 三、文件与文档
 
 | 文件 | 说明 |
@@ -60,6 +72,7 @@ Windows 下把 `python` 换成 `.\.venv\Scripts\python.exe`；一键建环境仍
 | `robot_profiles.py` | **型号真源**：三型号规格、驱动工厂、关节限位、读数接口、几何缩放、文案 |
 | `p340_view.py` | **P340 四轴面板**：角度条 / 趋势 / 坐标 / 平面姿态 / 3-4 轴切换 |
 | `check_env.py` | 依赖检查、串口扫描、可选联机只读测试（按型号选读数接口） |
+| `start_monitor.command` | **macOS 一键启动器**：双击启用 / `--model` / `--setup` / `--check` / `--dry-run` |
 | `examples/01~03` | 六轴示例：LED / 读角度 / 回零摆动（仅 280/320） |
 | `examples/04_p340_read_angles.py` | P340 专属只读角度 / 坐标示例 |
 | `README_320.md` / `README_P340.md` | 320 / P340 适配说明：参数对照、官方来源、边界与回滚 |
