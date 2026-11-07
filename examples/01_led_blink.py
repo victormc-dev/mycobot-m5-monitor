@@ -17,8 +17,8 @@ import robot_profiles as profiles  # noqa: E402  新增：280 / 320 型号适配
 
 def main():
     ap = argparse.ArgumentParser(description="myCobot 280 / 320 M5 末端 RGB 灯闪烁")
-    ap.add_argument("--model", default=profiles.DEFAULT_MODEL, choices=profiles.model_keys(),
-                    help="机械臂型号，默认 280；320 为新增适配")
+    ap.add_argument("--model", default=profiles.DEFAULT_MODEL, choices=("280", "320"),
+                    help="六轴型号 280 / 320；P340 请用 04_p340_read_angles.py")
     ap.add_argument("--port", default="", help="串口号，如 COM3（先跑 check_env.py 查看）")
     ap.add_argument("--baud", type=int, default=115200, help="M5 版本固定 115200")
     ap.add_argument("--loops", type=int, default=7, help="循环次数，默认 7")

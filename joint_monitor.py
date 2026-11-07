@@ -56,7 +56,7 @@ MIN_W, MIN_H = 880, 600          # 最小窗口；更小则主区自动出现纵
 BODY_MIN_H = 470                 # 主内容自然高度下限
 POSE_CHROME = 80                 # 3D 卡片除画布外的固定开销（标题 + 按钮行 + padding）
 RIGHT_CHROME = 212               # 右列除趋势画布外的固定开销（实测校准 + 8px 余量）
-LEFT_REQ_FULL, LEFT_REQ_SHORT = 660, 545   # 左列自然高度估算（说明全展开 / 精简，实测校准）
+LEFT_REQ_FULL, LEFT_REQ_SHORT = 700, 580   # 左列自然高度估算（含新增型号选择卡，实测校准）
 TOP_PAD, BOTTOM_PAD = 34, 26     # 3D 画布留给顶部指示条 / 底部提示的空间
 SIDE_PAD = 10
 
@@ -387,7 +387,9 @@ class MonitorApp(tk.Tk):
     def __init__(self, force_demo=False, model=profiles.DEFAULT_MODEL):
         super().__init__()
         self.profile = profiles.get_profile(model)
-        self.title(self.profile.label + "  六关节角度实时监控 / 六轴姿态动画")
+        self.model_var = tk.StringVar(value=self.profile.key)   # 选择卡 / 状态栏下拉共用
+        self.p340_view = None                                   # 四轴面板，按需创建
+        self.title(self._window_title())
         # 初始几何按屏幕工作区自适应，且不超过设计尺寸
         sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
         w = max(760, min(DESIGN_W, int(sw * 0.94), sw - 40))
@@ -420,6 +422,8 @@ class MonitorApp(tk.Tk):
         self._build_toolbar()
         self._build_body()
         self._build_status()
+        if self.profile.key == "p340":       # 命令行直接指定 P340
+            self._switch_view(self.profile)
         self.bind("<Configure>", self._on_resize)
         self.scan_ports()
         self._draw_pose(self.pose_angles)          # 零位立即可见
@@ -428,6 +432,29 @@ class MonitorApp(tk.Tk):
         if force_demo or self.demo_var.get():
             self.demo_var.set(True)
             self.after(300, self._auto_start_demo)
+
+    def _window_title(self):
+        suffix = ("四轴码垛臂监控" if self.profile.key == "p340"
+                  else "六关节角度实时监控 / 六轴姿态动画")
+        return self.profile.label + "  " + suffix
+
+    def _switch_view(self, prof):
+        """P340 切到独立四轴面板；280/320 用原六轴视图。
+
+        仅替换 Canvas window 项，六轴渲染、数据源、演示预设一律不动。
+        """
+        if prof.key == "p340":
+            if self.p340_view is None:
+                import p340_view
+                self.p340_view = p340_view.P340Panel(self.host_canvas,
+                                                     on_status=self._set_status)
+            target = self.p340_view
+        else:
+            target = self.body
+        self.host_canvas.itemconfig(self._body_win, window=target)
+        self.host_canvas.configure(scrollregion=(
+            0, 0, max(840, self.host_canvas.winfo_width()),
+            max(BODY_MIN_H, self.host_canvas.winfo_height())))
 
     def _auto_start_demo(self):
         if not self.running and self.demo_var.get():
@@ -504,6 +531,20 @@ class MonitorApp(tk.Tk):
         left = tk.Frame(body, bg=CARD, highlightthickness=1, highlightbackground=GRID)
         left.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
         self.left_frame = left
+
+        # 新增：机械臂型号选择卡（单行紧凑，280 / 320 / P340）
+        card = tk.Frame(left, bg="#F8FAFC", highlightthickness=1, highlightbackground=GRID)
+        card.pack(fill="x", padx=10, pady=(8, 2))
+        tk.Label(card, text="型号", bg="#F8FAFC", fg=MUTED,
+                 font=FONT_SMALL).pack(side="left", padx=(6, 3), pady=4)
+        short = {"280": "280 M5", "320": "320 M5", "p340": "P340"}
+        for key in profiles.model_keys():
+            tk.Radiobutton(card, text=short.get(key, key), value=key,
+                           variable=self.model_var, indicatoron=False,
+                           command=self._on_model_change, bg="#EDF1F6",
+                           selectcolor="#DBEAFE", fg=TEXT, font=FONT_TINY,
+                           relief="flat", padx=4, pady=1).pack(side="left", padx=1, pady=3)
+
         tk.Label(left, text="六关节角度  ( 单位: 度 )", bg=CARD, fg=TEXT,
                  font=FONT_UI_B).pack(anchor="w", padx=14, pady=(12, 2))
         self.limit_caption = tk.Label(
@@ -612,7 +653,6 @@ class MonitorApp(tk.Tk):
         # 新增：型号切换放在状态栏，不影响原有单行工具栏布局
         tk.Label(bar, text="型号", bg=CARD, fg=MUTED, font=FONT_SMALL).pack(
             side="right", padx=(0, 4))
-        self.model_var = tk.StringVar(value=self.profile.key)
         self.model_box = ttk.Combobox(bar, textvariable=self.model_var, width=6,
                                       state="readonly", font=FONT_SMALL,
                                       values=profiles.model_keys())
@@ -634,8 +674,10 @@ class MonitorApp(tk.Tk):
             self.tip_label.configure(
                 text=(self.profile.tip_short or TIP_SHORT) if compact
                 else (self.profile.tip_full or TIP_FULL))
+        # 新增：用左列真实请求高度兜底（型号选择卡加入后左列内容更高）
         need_h = max(BODY_MIN_H, POSE_CHROME + h_pose, RIGHT_CHROME + h_trend,
-                     LEFT_REQ_SHORT if compact else LEFT_REQ_FULL)
+                     LEFT_REQ_SHORT if compact else LEFT_REQ_FULL,
+                     self.left_frame.winfo_reqheight())
         h = max(evt.height, need_h)
         self.host_canvas.itemconfig(self._body_win, width=w, height=h)
         self.host_canvas.configure(scrollregion=(0, 0, w, h))
@@ -721,7 +763,8 @@ class MonitorApp(tk.Tk):
             self._set_status(str(exc))
             return
         self.profile = prof
-        self.title(prof.label + "  六关节角度实时监控 / 六轴姿态动画")
+        self.title(self._window_title())
+        self._switch_view(prof)
         self.limit_caption.configure(
             text=prof.limit_caption or "显示量程 ±180；实际限位以设备参数为准")
         self.tip_label.configure(
@@ -735,7 +778,9 @@ class MonitorApp(tk.Tk):
             for i, cv in enumerate(self.bar_canvases):
                 self._draw_bar(cv, self.last_angles[i], JOINT_COLORS[i], prof.display_limit)
         self._fit_snap = False
-        self._set_status("型号已切换：{} | {}".format(prof.label, profiles.summary(prof)))
+        self._set_status("型号已切换：{} | {}{}".format(
+            prof.label, profiles.summary(prof),
+            " | 四轴专用面板" if prof.key == "p340" else ""))
 
     def _toggle_run(self):
         if self.running:
@@ -751,6 +796,15 @@ class MonitorApp(tk.Tk):
             self._set_status("波特率必须是数字")
             return
         interval = int(str(self.interval_var.get()).split()[0])
+        if self.profile.key == "p340":
+            if self.p340_view is None:
+                self._switch_view(self.profile)
+            self.p340_view.start("" if demo else self.port_var.get(), baud, demo, interval)
+            self.running = True
+            self.frames = 0
+            self.history = []
+            self.run_btn.config(text="停止采集", bg="#DC2626")
+            return
         src = AngleSource("" if demo else self.port_var.get(), baud, demo,
                           self.preset_var.get(), profile=self.profile)
         self.reader = Reader(src, interval, self.q)
@@ -764,6 +818,8 @@ class MonitorApp(tk.Tk):
     def _stop(self):
         if self.reader is not None:
             self.reader.stop_evt.set()
+        if self.p340_view is not None:
+            self.p340_view.stop()
         self.running = False
         self.run_btn.config(text="开始采集", bg="#2563EB")
         self._set_status("已停止采集")
@@ -811,6 +867,10 @@ class MonitorApp(tk.Tk):
                     self._update(*payload)
         except queue.Empty:
             pass
+        if (self.profile.key == "p340" and self.p340_view is not None
+                and self.running and not self.p340_view.running):
+            self.running = False
+            self.run_btn.config(text="开始采集", bg="#2563EB")
         self.after(40, self._poll)
 
     def _animate(self):
@@ -819,7 +879,8 @@ class MonitorApp(tk.Tk):
         self.pose_angles = new_angles
         if self.running or moving:
             self.last_angles = self.pose_angles[:]
-            self._draw_pose(self.pose_angles, self.active_joint)
+            if self.profile.key != "p340":
+                self._draw_pose(self.pose_angles, self.active_joint)
         self.after(33, self._animate)
 
     def _update(self, angles, coords, elapsed_ms, active=-1):
@@ -1054,6 +1115,8 @@ class MonitorApp(tk.Tk):
 
     def _on_close(self):
         self._stop()
+        if self.p340_view is not None:
+            self.p340_view.close()
         if self.reader is not None:
             self.reader.join(timeout=2.0)
         self.destroy()
@@ -1139,6 +1202,17 @@ def selftest():
     assert profiles.over_limit(p320, [170, 0, 0, 0, 0, 0]) == [1]
     assert profiles.over_limit(profiles.get_profile(profiles.DEFAULT_MODEL),
                                [179, 0, 0, 0, 0, 0]) == []
+    p340 = profiles.get_profile("p340")
+    ok340, msg340 = profiles.driver_available(p340)
+    assert ok340, "P340 驱动不可用: {}".format(msg340)
+    assert p340.angle_api == "get_angles_info" and p340.coords_api == "get_coords_info"
+    assert p340.dof == 3 and p340.dof_options == (3, 4)
+    assert profiles.over_limit(p340, [0, 100, 0]) == [2], "J2 超限未识别"
+    assert profiles.over_limit(p340, [0, 0, 100]) == [3], "3 轴模式 J3 超限未识别"
+    assert profiles.over_limit(p340, [0, 0, 100], p340.joint_limits_alt) == [], \
+        "4 轴模式 J3 上限应为 110"
+    print("P340_OK driver={} dof={} axes={} limits_ok=True".format(
+        p340.driver_class, p340.dof, p340.dof_options))
     print("PROFILE_OK keys={} 320_driver={} geom_scale={} limits_ok=True".format(
         profiles.model_keys(), p320.driver_class, p320.geom_scale))
     print("SELFTEST_OK")
@@ -1259,9 +1333,10 @@ def pose_test():
 
 
 def main():
-    ap = argparse.ArgumentParser(description="myCobot 280 / 320 M5 六关节实时监控与六轴姿态动画")
+    ap = argparse.ArgumentParser(
+        description="myCobot 280 / 320 M5 与 ultraArm P340 关节实时监控")
     ap.add_argument("--model", default=profiles.DEFAULT_MODEL, choices=profiles.model_keys(),
-                    help="机械臂型号，默认 280（原有行为）；320 为新增适配")
+                    help="机械臂型号：280 默认 / 320 六轴 / p340 四轴码垛臂")
     ap.add_argument("--demo", action="store_true", help="启动即进入演示模式并自动开始动画")
     ap.add_argument("--selftest", action="store_true", help="无界面自检并退出")
     ap.add_argument("--pose-test", action="store_true", help="创建窗口验证 3D 绘制后退出")

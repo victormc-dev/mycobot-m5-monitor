@@ -2,11 +2,19 @@
 """型号适配层（新增模块，不改写原有 280 M5 实现）。
 
 默认型号仍为 myCobot 280 M5，行为与适配前完全一致；本模块额外提供
-myCobot 320 M5 的规格参数、驱动工厂与界面文案，供以下入口共同使用：
+myCobot 320 M5 与 ultraArm P340 的规格参数、驱动工厂与界面文案：
 
-    joint_monitor.py --model 320
-    check_env.py     --model 320
-    examples/*.py    --model 320
+    joint_monitor.py --model 320 / --model p340
+    check_env.py     --model 320 / --model p340
+    examples/*.py    --model 320（P340 使用专属只读示例）
+
+ultraArm P340 参数来源（大象机器人官方）：
+  - 产品参数页  https://www.elephantrobotics.com/ultraarm-p340-spcn/
+  - 产品手册    https://docs.elephantrobotics.com/docs/ultraArm/
+  - Python API   3-HowToUseultraArm/2-SoftwareControl/4-Python/2-PythonAPI.html
+  - 关节限位    官网表格 J1 -150~+170 / J2 -20~+90 / J3 -5~+75（3 轴）；
+                驱动 ultraArmP340.set_angle() 文档另记 J3 -5~+110、J4 ±179（4 轴）
+    读数接口：get_angles_info() / get_coords_info()（G-code 文本协议），与六轴不同。
 
 320 M5 参数来源（大象机器人官方）：
   - 产品参数页  https://www.elephantrobotics.com/mycobot-320-m5-cn/parameter/
@@ -53,6 +61,35 @@ TIP_SHORT_320 = (
 
 LIMIT_CAPTION_320 = "显示量程 ±175；J1~J5 限位 ±165、J6 ±175（超限提示）"
 
+# ultraArm P340：3 轴为出厂常规配置，第 4 轴为选配（官方标「自由度 3-4」）
+LIMIT_P340_3AXIS = (
+    (-150.0, 170.0),
+    (-20.0, 90.0),
+    (-5.0, 75.0),
+)
+LIMIT_P340_4AXIS = (
+    (-150.0, 170.0),
+    (-20.0, 90.0),
+    (-5.0, 110.0),
+    (-179.0, 179.0),
+)
+JOINT_NAMES_P340 = ("J1 基座回转", "J2 大臂", "J3 小臂", "J4 末端旋转（选配）")
+COORD_NAMES_P340 = ("X", "Y", "Z", "E")
+
+TIP_FULL_P340 = (
+    "型号：ultraArm P340｜3~4 轴步进码垛臂｜工作半径 340 mm｜负载 650 g\n"
+    "限位（3 轴）：J1 -150~+170°，J2 -20~+90°，J3 -5~+75°；\n"
+    "4 轴模式：J3 -5~+110°，J4 -179~+179°（超限在状态栏提示）。\n"
+    "供电 12V 5A，串口 115200；读数用 get_angles_info() / get_coords_info()。\n"
+    "界面左列选择卡切到 P340 后启用四轴专用面板：角度条 / 趋势 / 坐标 / 平面姿态。\n\n"
+    "注意：P340 不是六轴机械臂，不要套用 280/320 的 Transponder、Atom 固件与 24V 流程。"
+)
+TIP_SHORT_P340 = (
+    "P340：3~4 轴步进码垛臂，12V 5A / 115200，四轴专用面板。"
+    "选配第 4 轴可在面板内切换；姿态为平面几何示意。"
+)
+LIMIT_CAPTION_P340 = "P340 四轴面板：J1 -150~+170、J2 -20~+90、J3 -5~+75（超限提示）"
+
 
 @dataclass(frozen=True)
 class RobotProfile:
@@ -77,6 +114,15 @@ class RobotProfile:
     tip_full: str | None = None      # None → 界面沿用 280 原文案（不改写）
     tip_short: str | None = None
     limit_caption: str | None = None
+    # 以下为四轴/异构型号新增字段，均带默认值，280/320 行为完全不变
+    dof: int = 6
+    dof_options: tuple = ()
+    max_joints: int = 6
+    joint_names: tuple | None = None
+    coord_names: tuple | None = None
+    angle_api: str = "get_angles"
+    coords_api: str = "get_coords"
+    joint_limits_alt: tuple | None = None   # P340 选配 4 轴模式的限位
 
 
 PROFILES = {
@@ -122,11 +168,42 @@ PROFILES = {
         tip_short=TIP_SHORT_320,
         limit_caption=LIMIT_CAPTION_320,
     ),
+    "p340": RobotProfile(
+        key="p340",
+        label="ultraArm P340",
+        driver_module="pymycobot.ultraArmP340",
+        driver_class="ultraArmP340",
+        baud=115200,
+        reach_mm=340,
+        payload_g=650,
+        weight_g=2900,
+        repeatability="±0.1 mm",
+        power="12V 5A DC（100-240VAC 适配器）",
+        joint_limits=LIMIT_P340_3AXIS,
+        display_limit=180.0,
+        geom_scale=1.0,             # P340 使用独立四轴面板，不套用六轴 3D 几何
+        spec_url="https://www.elephantrobotics.com/ultraarm-p340-spcn/",
+        docs_url="https://docs.elephantrobotics.com/docs/ultraArm/",
+        hardware_note="外接 12V 5A 电源；串口 115200；按官方 ultraArm 文档安装驱动与固件",
+        dof=3,
+        dof_options=(3, 4),
+        max_joints=4,
+        joint_names=JOINT_NAMES_P340,
+        coord_names=COORD_NAMES_P340,
+        angle_api="get_angles_info",
+        coords_api="get_coords_info",
+        joint_limits_alt=LIMIT_P340_4AXIS,
+        tip_full=TIP_FULL_P340,
+        tip_short=TIP_SHORT_P340,
+        limit_caption=LIMIT_CAPTION_P340,
+    ),
 }
 
 _ALIASES = {
     "280": "280", "280m5": "280", "mycobot280": "280", "mycobot-280-m5": "280",
     "320": "320", "320m5": "320", "mycobot320": "320", "mycobot-320-m5": "320",
+    "p340": "p340", "ultraarm": "p340", "ultraarmp340": "p340",
+    "ultraarm-p340": "p340", "p340-ultraarm": "p340",
 }
 
 
@@ -177,12 +254,16 @@ def scale_geometry(base_h, link_len, grid_extent, scale):
     )
 
 
-def over_limit(profile: RobotProfile, angles):
-    """返回超出官方关节限位的关节编号列表（1~6）；280 未配置限位则返回 []。"""
-    if profile.joint_limits is None or not angles:
+def over_limit(profile: RobotProfile, angles, limits=None):
+    """返回超出官方关节限位的关节编号列表（1~N）；280 未配置限位则返回 []。
+
+    limits 可覆盖 profile.joint_limits（P340 选配 4 轴模式传 joint_limits_alt）。
+    """
+    lim = limits if limits is not None else profile.joint_limits
+    if lim is None or not angles:
         return []
     out = []
-    for i, (lo, hi) in enumerate(profile.joint_limits):
+    for i, (lo, hi) in enumerate(lim):
         try:
             v = float(angles[i])
         except (IndexError, TypeError, ValueError):
@@ -190,6 +271,37 @@ def over_limit(profile: RobotProfile, angles):
         if v < lo or v > hi:
             out.append(i + 1)
     return out
+
+
+def read_angles(robot, profile: RobotProfile):
+    """按型号调用正确的角度读取接口，统一返回 list[float]；失败返回 None。
+
+    六轴用 get_angles()，ultraArm P340 用 get_angles_info()（G-code 文本协议）。
+    """
+    try:
+        vals = getattr(robot, profile.angle_api)()
+    except Exception:
+        return None
+    if not vals:
+        return None
+    try:
+        return [float(x) for x in vals]
+    except (TypeError, ValueError):
+        return None
+
+
+def read_coords(robot, profile: RobotProfile):
+    """按型号调用正确的坐标读取接口，统一返回 list[float]；失败返回 None。"""
+    try:
+        vals = getattr(robot, profile.coords_api)()
+    except Exception:
+        return None
+    if not vals:
+        return None
+    try:
+        return [float(x) for x in vals]
+    except (TypeError, ValueError):
+        return None
 
 
 def summary(profile: RobotProfile) -> str:
@@ -203,5 +315,5 @@ def summary(profile: RobotProfile) -> str:
 __all__ = [
     "DEFAULT_MODEL", "PROFILES", "RobotProfile", "create_robot",
     "driver_available", "get_profile", "model_keys", "over_limit",
-    "scale_geometry", "summary",
+    "read_angles", "read_coords", "scale_geometry", "summary",
 ]

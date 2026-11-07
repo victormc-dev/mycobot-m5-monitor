@@ -4,7 +4,7 @@
 
 - **不带 `--model` 运行时，行为与适配前完全一致（280 M5）**；
 - 加 `--model 320` 或在界面右下角「型号」下拉切到 `320`，即按 320 M5 的驱动、限位、量程、几何比例与硬件提示运行；
-- `README.md` 现已在开头新增双型号总览，**原 280 全文一字未改地保留为附录章节**；`requirements.txt`、`setup.ps1`、`start_monitor.cmd`、`vendor/` 未改动。
+- `README.md` 现已在开头新增三型号总览，**原 280 全文一字未改地保留为附录章节**；`requirements.txt`、`setup.ps1`、`start_monitor.cmd`、`vendor/` 未改动。
 
 ---
 

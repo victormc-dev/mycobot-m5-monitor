@@ -1,6 +1,6 @@
 # myCobot M5 Monitor
 
-**myCobot M5 系列六关节角度实时监控 + 六轴 3D 姿态动画**。一套界面、一套代码，支持 **280 M5（默认）** 与 **320 M5（新增适配）** 双型号。
+**myCobot 280 / 320 M5 六轴关节监控 + ultraArm P340 四轴码垛臂监控**。一套界面、一套代码，支持 **280 M5（默认）**、**320 M5**、**ultraArm P340** 三个型号；界面左列「机械臂型号」选择卡可随时切换。
 
 > 仓库已由 `mycobot-280-m5-monitor` 更名为 **[mycobot-m5-monitor](https://github.com/victormc-dev/mycobot-m5-monitor)**。GitHub 自动重定向旧链接；已有本地克隆可执行
 > `git remote set-url origin https://github.com/victormc-dev/mycobot-m5-monitor.git`
@@ -11,17 +11,19 @@
 
 ## 一、支持型号
 
-| 项目 | 280 M5（默认） | 320 M5（`--model 320`） |
-|---|---|---|
-| Python 驱动 | `MyCobot280` | `MyCobot320` |
-| 串口波特率 | 115200 | 115200 |
-| 工作半径 / 负载 | 280 mm / 原项目未声明 | 350 mm / 1 kg |
-| 供电 | 12V / 3–5A，DC 5.5×2.1 | **DC 24V**（官网 120W / 文档 9.2A，以适配器铭牌为准） |
-| 关节限位 | ±180 显示量程 | J1~J5 ±165°、J6 ±175°，超限提示 |
-| 3D 姿态连杆 | 原始尺寸 | ×1.25 等比缩放（几何示意，非精确 DH） |
-| 硬件流程 | Transponder / `Atom: OK` | 按官方 320 M5 首次使用流程确认串口转发 |
+| 项目 | 280 M5（默认） | 320 M5 | ultraArm P340 |
+|---|---|---|---|
+| 类型 | 6 轴协作臂 | 6 轴协作臂 | **3~4 轴步进码垛臂** |
+| Python 驱动 | `MyCobot280` | `MyCobot320` | `ultraArmP340` |
+| 读数接口 | `get_angles()` | `get_angles()` | **`get_angles_info()`** |
+| 串口波特率 | 115200 | 115200 | 115200 |
+| 工作半径 / 负载 | 280 mm / 原项目未声明 | 350 mm / 1 kg | 340 mm / 650 g |
+| 供电 | 12V / 3–5A，DC 5.5×2.1 | **DC 24V**（官网 120W / 文档 9.2A） | 12V 5A DC |
+| 关节限位 | ±180 显示量程 | J1~J5 ±165°、J6 ±175° | J1 −150~+170°、J2 −20~+90°、J3 −5~+75° |
+| 姿态视图 | 六轴 3D 球腕链 | 六轴 3D（连杆 ×1.25） | **独立四轴平面姿态面板** |
+| 硬件流程 | Transponder / `Atom: OK` | 官方 320 首次使用流程 | 官方 ultraArm 文档，无 Transponder/Atom |
 
-**不带 `--model` 运行即为 280 M5**，行为与 v1.0.0 逐行比对一致；320 为增量适配，未改写原有实现。
+**不带 `--model` 运行即为 280 M5**，行为与 v1.0.0 逐行比对一致；320 与 P340 均为增量适配，**六轴渲染实现从未改写**。P340 因关节数与读数协议不同，使用 `p340_view.py` 独立面板。
 
 ## 二、快速开始
 
@@ -29,45 +31,53 @@
 # 环境自检（不接硬件即可运行）
 python check_env.py
 python check_env.py --model 320
+python check_env.py --model p340
 
-# 启动监控界面（右下角「型号」下拉也可随时切换）
+# 启动监控界面（左列选择卡 / 状态栏下拉均可切换）
 python joint_monitor.py
 python joint_monitor.py --model 320 --demo
+python joint_monitor.py --model p340 --demo    # 四轴独立面板
 
-# 无界面自检：演示预设 / 运动学矩阵 / 320 适配层断言
+# 无界面自检：演示预设 / 运动学矩阵 / 320 与 P340 适配层断言
 python joint_monitor.py --selftest
 
-# 示例（均支持 --model）
+# 六轴示例（仅 280/320）
 python examples/01_led_blink.py --model 320 --dry-run
 python examples/02_read_angles.py --model 320 --port COM3
+
+# P340 专属只读示例（--axes 3/4 对应官方 3-4 自由度）
+python examples/04_p340_read_angles.py --port COM3
+python examples/04_p340_read_angles.py --port COM3 --axes 4
 ```
 
-Windows 下把 `python` 换成 `.\.venv\Scripts\python.exe`；一键建环境仍用原文的 `setup.ps1`。离线模式直接 `python` 即可——`vendor/` 已解包 `pymycobot 3.9.9` + `pyserial 3.5`，且已内含 `mycobot320.py`，**320 适配零新增依赖**。
+Windows 下把 `python` 换成 `.\.venv\Scripts\python.exe`；一键建环境仍用原文的 `setup.ps1`。离线模式直接 `python` 即可——`vendor/` 已解包 `pymycobot 3.9.9` + `pyserial 3.5`，内含 `mycobot320.py` 与 `ultraArmP340.py`，**320 / P340 适配均零新增依赖**。前三个示例依赖六轴 API，不适用于 P340。
 
 ## 三、文件与文档
 
 | 文件 | 说明 |
 |---|---|
-| `joint_monitor.py` | 主程序：三列界面、六轴 3D 姿态、角度条 / 趋势曲线、四种演示预设、自检 |
-| `robot_profiles.py` | **型号真源**：规格参数、驱动工厂、关节限位、几何缩放、界面文案 |
-| `check_env.py` | 依赖检查、串口扫描、可选联机只读测试 |
-| `examples/` | LED 闪烁 / 读取角度 / 回零摆动（带安全确认） |
-| `README_320.md` | **320 M5 适配说明**：参数对照、官方来源、边界与回滚 |
-| `backup_280_original/` | 适配前 5 个文件的原件备份 |
-| `vendor/` | 离线依赖（已含 `mycobot320.py`） |
+| `joint_monitor.py` | 主程序：三列界面、**左列型号选择卡**、六轴 3D 姿态、角度条 / 趋势、四种演示预设、自检 |
+| `robot_profiles.py` | **型号真源**：三型号规格、驱动工厂、关节限位、读数接口、几何缩放、文案 |
+| `p340_view.py` | **P340 四轴面板**：角度条 / 趋势 / 坐标 / 平面姿态 / 3-4 轴切换 |
+| `check_env.py` | 依赖检查、串口扫描、可选联机只读测试（按型号选读数接口） |
+| `examples/01~03` | 六轴示例：LED / 读角度 / 回零摆动（仅 280/320） |
+| `examples/04_p340_read_angles.py` | P340 专属只读角度 / 坐标示例 |
+| `README_320.md` / `README_P340.md` | 320 / P340 适配说明：参数对照、官方来源、边界与回滚 |
+| `backup_280_original/` / `backup_before_p340/` | 两轮适配前的文件备份 |
+| `vendor/` | 离线依赖（含 `mycobot320.py` 与 `ultraArmP340.py`） |
 
 ## 四、版本
 
 | 版本 | 内容 |
 |---|---|
 | `v1.0.0` | 280 M5 原版（适配前快照），已发布 Release |
-| `main` | 280 默认 + 320 增量适配，双型号并存 |
+| `main` | 280 默认 + 320 / P340 增量适配，三型号并存 |
 
 ---
 
 ## 附录：myCobot 280 M5 原始环境文档（原文保留）
 
-以下为适配前 `README.md` 的**全文，一字未改**，供 280 M5 的驱动安装、固件烧录、myStudio 使用与排错查阅。其中「12V 供电 / Transponder / Atom 固件」等内容**仅适用于 280 M5**；320 M5 请以上文表格及 `README_320.md` 为准。
+以下为适配前 `README.md` 的**全文，一字未改**，供 280 M5 的驱动安装、固件烧录、myStudio 使用与排错查阅。其中「Transponder / Atom 固件」等内容**仅适用于 280 M5**；320 M5 与 P340 请以上文表格及 `README_320.md` / `README_P340.md` 为准。
 
 ---
 

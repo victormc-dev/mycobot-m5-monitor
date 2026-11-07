@@ -6,6 +6,7 @@
     python check_env.py --port COM3          # 追加联机只读测试
     python check_env.py --port COM3 --baud 115200
     python check_env.py --model 320            # 新增：按 320 M5 规格自检
+    python check_env.py --model p340           # 新增：按 ultraArm P340 规格自检
 """
 
 import argparse
@@ -85,16 +86,20 @@ def main():
     show("型号规格", profiles.summary(prof))
     show("波特率", str(args.baud) + "  (M5 版本必须为 115200)")
     show("供电", prof.power)
-    show("Basic 屏", "按官方首次使用流程烧录固件并确认串口转发就绪"
-         if prof.key == "320" else "Transponder 功能，按 A 显示 Atom: OK")
+    show("Basic 屏",
+         "12V 5A 供电；按官方 ultraArm 文档烧录固件，无 Transponder/Atom 流程"
+         if prof.key == "p340" else
+         ("按官方首次使用流程烧录固件并确认串口转发就绪" if prof.key == "320"
+          else "Transponder 功能，按 A 显示 Atom: OK"))
 
     if args.port:
         print("[5] 联机只读测试  {}".format(args.port))
         try:
             mc = profiles.create_robot(prof, args.port, args.baud)
             show("驱动实例", prof.driver_class)
-            angles = mc.get_angles()
-            coords = mc.get_coords()
+            show("读数接口", "{} / {}".format(prof.angle_api, prof.coords_api))
+            angles = profiles.read_angles(mc, prof)
+            coords = profiles.read_coords(mc, prof)
             show("关节角", angles)
             show("末端坐标", coords)
             show("结果", "串口已打开" + ("，机械臂有响应" if angles else "，但未收到数据（检查 Transponder / 固件）"))

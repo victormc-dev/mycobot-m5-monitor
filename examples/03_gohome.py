@@ -20,8 +20,8 @@ ZERO = [0, 0, 0, 0, 0, 0]
 
 def main():
     ap = argparse.ArgumentParser(description="myCobot 280 / 320 M5 回零与单关节摆动")
-    ap.add_argument("--model", default=profiles.DEFAULT_MODEL, choices=profiles.model_keys(),
-                    help="机械臂型号，默认 280；320 为新增适配")
+    ap.add_argument("--model", default=profiles.DEFAULT_MODEL, choices=("280", "320"),
+                    help="六轴型号 280 / 320；P340 请用 04_p340_read_angles.py")
     ap.add_argument("--port", default="", help="串口号，如 COM3")
     ap.add_argument("--baud", type=int, default=115200)
     ap.add_argument("--speed", type=int, default=20, help="运动速度 0-100，默认 20")
