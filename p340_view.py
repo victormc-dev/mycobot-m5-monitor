@@ -85,6 +85,158 @@ def demo_angles(t, preset=DEMO_PRESETS[0], n=3):
     return [round(x, 2) for x in vals[:n]], -1
 
 
+# ---- P340 3D 姿态数学（独立实现，不改动六轴主程序） ----
+POSE_GRID = 120.0        # 地面网格半径（可视化单位）
+L3 = 26.0                # 腕 / 工具段长度
+RING_R = 12.0            # 关节轴环半径
+POSE_TOP, POSE_BOTTOM, POSE_SIDE = 34, 26, 10
+
+
+def m3mul(a, b):
+    return [[a[i][0]*b[0][j] + a[i][1]*b[1][j] + a[i][2]*b[2][j]
+             for j in range(3)] for i in range(3)]
+
+
+def m3col(m, j):
+    return [m[0][j], m[1][j], m[2][j]]
+
+
+def rot_z(deg):
+    r = math.radians(deg); c, s = math.cos(r), math.sin(r)
+    return [[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]]
+
+
+def rot_y(deg):
+    r = math.radians(deg); c, s = math.cos(r), math.sin(r)
+    return [[c, 0.0, s], [0.0, 1.0, 0.0], [-s, 0.0, c]]
+
+
+def rot_x(deg):
+    r = math.radians(deg); c, s = math.cos(r), math.sin(r)
+    return [[1.0, 0.0, 0.0], [0.0, c, -s], [0.0, s, c]]
+
+
+def vadd(p, v, k=1.0):
+    return [p[0] + v[0]*k, p[1] + v[1]*k, p[2] + v[2]*k]
+
+
+def vcross(a, b):
+    return [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]]
+
+
+def vnorm(v):
+    n = math.sqrt(sum(x*x for x in v))
+    return [x/n for x in v] if n > 1e-9 else [0.0, 0.0, 1.0]
+
+
+def ortho_basis(axis):
+    u = vnorm(axis)
+    ref = [0.0, 0.0, 1.0] if abs(u[2]) < 0.9 else [1.0, 0.0, 0.0]
+    v = vnorm(vcross(u, ref))
+    return v, vnorm(vcross(u, v))
+
+
+def project(point, az, el, scale, ox, oy):
+    """正交投影，返回 (screen_x, screen_y, depth)，depth 越大越远。"""
+    ca, sa = math.cos(az), math.sin(az)
+    x1 = ca*point[0] - sa*point[1]
+    y1 = sa*point[0] + ca*point[1]
+    z1 = point[2]
+    ce, se = math.cos(el), math.sin(el)
+    sy = z1*ce - y1*se
+    depth = y1*ce + z1*se
+    return ox + x1*scale, oy - sy*scale, depth
+
+
+def build_arm_3d(angles, n=3):
+    """J1 绕世界 Z；J2/J3 肩肘共面俯仰（局部 Y）；J4 绕连杆轴 Z 自转。
+
+    连杆始终沿局部 Z；n=3 时忽略 J4 角度（选配轴）。
+    """
+    a = [float(x or 0.0) for x in list(angles)[:4]]
+    a += [0.0] * (4 - len(a))
+    segments, joints, frames = [], [], []
+    p = [0.0, 0.0, 0.0]
+    top = [0.0, 0.0, BASE_H]
+    segments.append((p, top, 0))
+    p = top
+    joints.append((p, [0.0, 0.0, 1.0], 0))       # J1 轴：世界 Z
+    R = rot_z(a[0])
+    frames.append(R)
+    d0 = m3col(R, 0)
+    pointer = [d0[0]*30.0, d0[1]*30.0, 6.0]
+    joints.append((p, m3col(R, 1), 1))           # J2 轴：局部 Y
+    R = m3mul(R, rot_y(a[1]))
+    frames.append(R)
+    p1 = vadd(p, m3col(R, 2), L1)
+    segments.append((p, p1, 1)); p = p1
+    joints.append((p, m3col(R, 1), 2))           # J3 轴：局部 Y
+    R = m3mul(R, rot_y(-a[2]))
+    frames.append(R)
+    p2 = vadd(p, m3col(R, 2), L2)
+    segments.append((p, p2, 2)); p = p2
+    joints.append((p, m3col(R, 2), 3))           # J4 轴：连杆轴 Z
+    R = m3mul(R, rot_z(a[3] if n == 4 else 0.0))
+    frames.append(R)
+    tip = vadd(p, m3col(R, 2), L3)
+    segments.append((p, tip, 3)); p = tip
+    ex, ez = m3col(R, 0), m3col(R, 2)
+    cross = (vadd(p, ex, -12.0), vadd(p, ex, 12.0))
+    fingers = [(vadd(p, ex, sign*7.0),
+                vadd(vadd(p, ex, sign*7.0), ez, 12.0)) for sign in (-1.0, 1.0)]
+    return {"segments": segments, "joints": joints, "frames": frames,
+            "tip": p, "frame": R, "base_pointer": pointer, "base_h": BASE_H,
+            "cross": cross, "fingers": fingers}
+
+
+def pose_points_3d(arm):
+    """3D 视图中所有需要保证可见的点（含地面网格四角）。"""
+    pts = []
+    for p0, p1, _ in arm["segments"]:
+        pts.extend((p0, p1))
+    for center, _axis, _idx in arm["joints"]:
+        pts.append(center)
+    pts.extend(arm["cross"])
+    for root, tip in arm["fingers"]:
+        pts.extend((root, tip))
+    pts.extend((arm["base_pointer"], arm["tip"]))
+    for x in (-POSE_GRID, POSE_GRID):
+        for y in (-POSE_GRID, POSE_GRID):
+            pts.append([x, y, 0.0])
+    return pts
+
+
+def pose3d_selftest():
+    """纯软件自检：旋转矩阵正交、坐标有限、多尺寸投影不越界。"""
+    for ang in ([0.0]*4, [40.0, 35.0, 35.0, 60.0], [-90.0, 60.0, 60.0, -120.0]):
+        arm = build_arm_3d(ang, 4)
+        Rm = arm["frame"]
+        for i in range(3):
+            assert abs(sum(Rm[i][k]**2 for k in range(3)) - 1.0) < 1e-9
+        for i in range(3):
+            for j in range(i+1, 3):
+                assert abs(sum(Rm[i][k]*Rm[j][k] for k in range(3))) < 1e-9
+        for p0, p1, _ in arm["segments"]:
+            for v in (p0, p1):
+                assert all(math.isfinite(x) for x in v), "3D 点非有限值"
+        pts = pose_points_3d(arm)
+        for W, H in ((330, 360), (240, 180), (700, 520)):
+            for az, el in ((0.0, 0.4), (0.9, 1.1), (2.4, 0.0)):
+                raw = [project(v, az, el, 1.0, 0.0, 0.0) for v in pts]
+                xs = [r[0] for r in raw]; ys = [r[1] for r in raw]
+                spanx = max(1.0, max(xs)-min(xs)); spany = max(1.0, max(ys)-min(ys))
+                sc = min(max(30.0, W-2*POSE_SIDE)/spanx,
+                         max(30.0, H-POSE_TOP-POSE_BOTTOM)/spany) * 0.92
+                sc = max(0.01, min(2.5, sc))
+                ox = W/2 - (min(xs)+max(xs))/2*sc
+                oy = POSE_TOP + max(30.0, H-POSE_TOP-POSE_BOTTOM)/2 - (min(ys)+max(ys))/2*sc
+                for v in pts:
+                    sx, sy, _d = project(v, az, el, sc, ox, oy)
+                    assert -2.0 <= sx <= W+2 and -2.0 <= sy <= H+2, \
+                        "画布 {}x{} 3D 点越界".format(W, H)
+    return True
+
+
 class _P340Source:
     """P340 真机 / 演示数据源。真机走官方 G-code 文本协议读数接口。"""
 
@@ -145,6 +297,13 @@ class P340Panel(tk.Frame):
         self._axis_n = self.profile.dof                    # 采集线程读取，避免跨线程访问 tk 变量
         self._preset = DEMO_PRESETS[0]                     # 采集线程读取当前演示预设
         self._resize_job = None
+        self.pose_mode = tk.StringVar(value="3d")          # 3D 姿态 / 2D 侧视
+        self.view_az = math.radians(-35.0)
+        self.view_el = math.radians(24.0)
+        self.view_zoom = 1.0
+        self._drag = None
+        self.auto_fit = 1.0
+        self._fit_snap = False
         self.q = queue.Queue()
         self.thread = None
         self.stop_evt = threading.Event()
@@ -218,14 +377,27 @@ class P340Panel(tk.Frame):
                  bg=CARD, fg=MUTED, font=FONT_SMALL, justify="left").pack(
             anchor="w", padx=12, pady=(14, 10))
 
-        # 中：平面姿态示意
+        # 中：3D 姿态（可切 2D 侧视）
         mid = tk.Frame(body, bg=CARD, highlightthickness=1, highlightbackground=GRID)
         mid.grid(row=0, column=1, sticky="nsew", padx=(0, 8))
-        tk.Label(mid, text="平面姿态示意（J1 基座 / J2 大臂 / J3 小臂）", bg=CARD, fg=TEXT,
-                 font=FONT_UI_B).pack(anchor="w", padx=12, pady=(12, 2))
+        tk.Label(mid, text="姿态视图（J1 基座 / J2 大臂 / J3 小臂 / J4 选配）",
+                 bg=CARD, fg=TEXT, font=FONT_UI_B).pack(anchor="w", padx=12, pady=(12, 2))
+        mode_row = tk.Frame(mid, bg=CARD)
+        mode_row.pack(fill="x", padx=12, pady=(0, 2))
+        for txt, val in (("3D 姿态", "3d"), ("2D 侧视", "2d")):
+            tk.Radiobutton(mode_row, text=txt, value=val, variable=self.pose_mode,
+                           indicatoron=False, command=self._draw_pose, bg="#EDF1F6",
+                           selectcolor="#DBEAFE", fg=TEXT, font=FONT_SMALL,
+                           relief="flat", padx=8, pady=1).pack(side="left", padx=2)
+        tk.Button(mode_row, text="复位视角", command=self._pose_reset, font=FONT_SMALL,
+                  relief="flat", bg="#EDF1F6", fg=TEXT, padx=8).pack(side="right")
         self.pose = tk.Canvas(mid, width=330, height=360, bg=CARD, highlightthickness=0)
-        self.pose.pack(fill="both", expand=True, padx=12, pady=(0, 4))
-        tk.Label(mid, text="几何示意，非精确运动学解算；J4 选配轴以末端横销表示",
+        self.pose.pack(fill="both", expand=True, padx=12, pady=(0, 2))
+        self.pose.bind("<ButtonPress-1>", self._pose_press)
+        self.pose.bind("<B1-Motion>", self._pose_drag)
+        self.pose.bind("<MouseWheel>", self._pose_wheel)
+        self.pose.bind("<Double-Button-1>", lambda e: self._pose_reset())
+        tk.Label(mid, text="拖动旋转 / 滚轮缩放 / 双击复位；几何示意，非精确 DH 解算",
                  bg=CARD, fg=MUTED, font=FONT_SMALL).pack(anchor="w", padx=12, pady=(0, 10))
 
         # 右：趋势 + 末端坐标
@@ -489,7 +661,152 @@ class P340Panel(tk.Frame):
         c.create_text(pl, h - 8, anchor="w", fill=MUTED, font=FONT_TINY, text="-{} 帧".format(HISTORY))
         c.create_text(w - pr, h - 8, anchor="e", fill=MUTED, font=FONT_TINY, text="现在")
 
-    def _draw_pose(self, angles):
+    def _draw_pose(self, angles=None):
+        """按当前模式分派：默认 3D 姿态，可切 2D 侧视。"""
+        if angles is None:
+            angles = self.last_angles
+        if self.pose_mode.get() == "2d":
+            return self._draw_pose_2d(angles)
+        return self._draw_pose_3d(angles)
+
+    # ---- 3D 视角交互
+    def _pose_press(self, evt):
+        self._drag = (evt.x, evt.y, self.view_az, self.view_el)
+
+    def _pose_drag(self, evt):
+        if not self._drag:
+            return
+        x0, y0, az0, el0 = self._drag
+        self.view_az = az0 + (evt.x - x0) * 0.010
+        self.view_el = max(-0.25, min(1.30, el0 + (evt.y - y0) * 0.007))
+        self._draw_pose(self.last_angles)
+
+    def _pose_wheel(self, evt):
+        self.view_zoom = max(0.55, min(2.0, self.view_zoom * (1.10 if evt.delta > 0 else 0.90)))
+        self._draw_pose(self.last_angles)
+
+    def _pose_reset(self):
+        self.view_az = math.radians(-35.0)
+        self.view_el = math.radians(24.0)
+        self.view_zoom = 1.0
+        self.auto_fit = 1.0
+        self._fit_snap = True
+        self._draw_pose(self.last_angles)
+        self._fit_snap = False
+
+    def _fit_pose_3d(self, arm, W, H):
+        """按所有 3D 点包围盒求缩放与居中，保证完整可见。"""
+        pts = pose_points_3d(arm)
+        raw = [project(v, self.view_az, self.view_el, 1.0, 0.0, 0.0) for v in pts]
+        xs = [r[0] for r in raw]; ys = [r[1] for r in raw]
+        minx, maxx, miny, maxy = min(xs), max(xs), min(ys), max(ys)
+        spanx = max(1.0, maxx-minx); spany = max(1.0, maxy-miny)
+        avail_w = max(30.0, W - 2*POSE_SIDE)
+        avail_h = max(30.0, H - POSE_TOP - POSE_BOTTOM)
+        target = min(avail_w/spanx, avail_h/spany) * 0.92
+        target = max(0.01, min(2.50, target))
+        if self._fit_snap:
+            self.auto_fit = target
+        else:
+            self.auto_fit += (target - self.auto_fit) * 0.18
+        sc = self.auto_fit * self.view_zoom
+        ox = W/2 - (minx+maxx)/2*sc
+        oy = POSE_TOP + avail_h/2 - (miny+maxy)/2*sc
+        return sc, ox, oy
+
+    def _draw_pose_3d(self, angles):
+        c = self.pose
+        c.delete("all")
+        W = c.winfo_width(); H = c.winfo_height()
+        if W < 40: W = 330
+        if H < 40: H = 360
+        n = self.axis_var.get()
+        arm = build_arm_3d(angles, n)
+        sc, ox, oy = self._fit_pose_3d(arm, W, H)
+        az, el = self.view_az, self.view_el
+
+        def P(v):
+            return project(v, az, el, sc, ox, oy)
+
+        items = []
+        def add_line(p0, p1, color, width):
+            s0, s1 = P(p0), P(p1)
+            d = (s0[2]+s1[2])/2.0
+            items.append((d, len(items),
+                          lambda s0=s0, s1=s1, color=color, width=width:
+                          c.create_line(s0[0], s0[1], s1[0], s1[1], fill=color,
+                                        width=width, capstyle=tk.ROUND)))
+        def add_poly(points, color, width):
+            sp = [P(v) for v in points]
+            d = sum(v[2] for v in sp)/len(sp)
+            flat = [x for v in sp for x in (v[0], v[1])]
+            items.append((d, len(items),
+                          lambda flat=flat, color=color, width=width:
+                          c.create_line(*flat, fill=color, width=width, capstyle=tk.ROUND)))
+        def add_dot(p3, r, fill, outline, width=1):
+            s = P(p3)
+            items.append((s[2], len(items),
+                          lambda s=s, r=r, fill=fill, outline=outline, width=width:
+                          c.create_oval(s[0]-r, s[1]-r, s[0]+r, s[1]+r,
+                                        fill=fill, outline=outline, width=width)))
+
+        g = POSE_GRID
+        for k in range(-2, 3):
+            t = k * g * 46.0 / 96.0
+            add_line([t, -g, 0.0], [t, g, 0.0], FLOOR, 1)
+            add_line([-g, t, 0.0], [g, t, 0.0], FLOOR, 1)
+        add_dot([0, 0, 0], 24, "#CBD5E1", "#94A3B8", 1)
+        add_line([0, 0, 0], [0, 0, arm["base_h"]], "#94A3B8", 10)
+        add_line([0, 0, 6.0], arm["base_pointer"], JOINT_COLORS[0], 3)
+        for p0, p1, idx in arm["segments"]:
+            col = "#94A3B8" if idx == 0 else JOINT_COLORS[idx]
+            add_line(p0, p1, "#CBD5E1", 11)
+            add_line(p0, p1, col, 6)
+        if n == 4:
+            add_line(arm["cross"][0], arm["cross"][1], JOINT_COLORS[3], 4)
+            for root, tip in arm["fingers"]:
+                add_line(root, tip, JOINT_COLORS[3], 4)
+        for center, axis, idx in arm["joints"]:
+            if idx >= n:
+                continue
+            v, w = ortho_basis(axis)
+            r = RING_R + (2.0 if idx == self.active_joint else 0.0)
+            ring = [vadd(vadd(center, v, r*math.cos(t*math.pi/12.0)),
+                         w, r*math.sin(t*math.pi/12.0)) for t in range(24)]
+            add_poly(ring + [ring[0]], JOINT_COLORS[idx],
+                     3.5 if idx == self.active_joint else 2.0)
+        for center, _axis, idx in arm["joints"]:
+            if idx >= n:
+                continue
+            fill = JOINT_COLORS[idx] if idx == self.active_joint else CARD
+            add_dot(center, 6 if idx == self.active_joint else 5, fill, TEXT, 2)
+        add_dot(arm["tip"], 4, "#EF4444", CARD, 1)
+        for _d, _seq, fn in sorted(items, key=lambda it: (-it[0], it[1])):
+            fn()
+        for center, _axis, idx in arm["joints"]:
+            if idx >= n:
+                continue
+            sp = P(center)
+            c.create_text(sp[0]+12, sp[1]-11, text="J{}".format(idx+1),
+                          fill=JOINT_COLORS[idx], font=("Consolas", 9, "bold"), anchor="w")
+        cell = W / float(n)
+        for i in range(n):
+            on = (i == self.active_joint)
+            c.create_rectangle(i*cell+3, 6, (i+1)*cell-3, 24,
+                               fill=JOINT_COLORS[i] if on else "#EEF2F7", outline="")
+            txt = ("J{} {:+.0f}".format(i+1, angles[i] or 0.0)
+                   if cell >= 62 else "J{}".format(i+1))
+            c.create_text(i*cell+cell/2, 15, text=txt,
+                          fill="#FFFFFF" if on else JOINT_COLORS[i], font=FONT_TINY)
+        state = ("当前演示 J{}".format(self.active_joint+1)
+                 if self.active_joint >= 0 else "四轴联动")
+        hint = ("拖动旋转 | 滚轮缩放 | 双击复位    " + state) if W >= 470 else state
+        c.create_text(10, H-12, anchor="w", fill=MUTED, font=FONT_SMALL, text=hint)
+        if W >= 430:
+            c.create_text(W-10, H-12, anchor="e", fill=MUTED, font=FONT_TINY,
+                          text="3D 几何示意 / 非精确 DH 解算")
+
+    def _draw_pose_2d(self, angles):
         c = self.pose
         c.delete("all")
         W = max(200, c.winfo_width())
@@ -553,4 +870,4 @@ class P340Panel(tk.Frame):
         self._draw_pose(self.last_angles)
 
 
-__all__ = ["P340Panel", "DEMO_PRESETS", "demo_angles"]
+__all__ = ["P340Panel", "DEMO_PRESETS", "demo_angles", "pose3d_selftest"]

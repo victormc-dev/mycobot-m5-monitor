@@ -1214,9 +1214,11 @@ def selftest():
     assert ok340, "P340 驱动不可用: {}".format(msg340)
     assert p340.angle_api == "get_angles_info" and p340.coords_api == "get_coords_info"
     assert p340.dof == 3 and p340.dof_options == (3, 4)
+    import p340_view
+    p340_view.pose3d_selftest()
+    print("P340_3D_OK orthogonal=True projection=True all_points_inside=True")
 
     # 新增：四个演示预设在 3 / 4 轴下均合法、不越官方限位
-    import p340_view
     assert tuple(p340_view.DEMO_PRESETS) == DEMO_PRESETS, "P340 预设与主动作下拉不一致"
     for preset in DEMO_PRESETS:
         for axes in (3, 4):
