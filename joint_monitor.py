@@ -328,11 +328,20 @@ class AngleSource:
 
         self.active = -1
         self._n += 1
-        angles = self.mc.get_angles()
+        try:
+            angles = self.mc.get_angles()
+        except Exception:
+            angles = None
+        # 串口未就绪 / 通信异常时 get_angles() 可能返回 int（错误码）等非序列值，
+        # 这里统一校验类型，避免 len() 对 int 报错导致线程中断。
+        if not isinstance(angles, (list, tuple)):
+            angles = None
         coords = None
         if self._n % 5 == 1:                 # 坐标读取降频，减少串口往返
             try:
                 coords = self.mc.get_coords()
+                if not isinstance(coords, (list, tuple)):
+                    coords = None
             except Exception:
                 coords = None
         if coords:
@@ -341,6 +350,48 @@ class AngleSource:
         if not angles or len(angles) < 6:    # 无响应时保留上一帧
             return None, self._coords, ms, -1
         return [float(x) for x in angles[:6]], self._coords, ms, -1
+
+    def send_angle(self, joint_id, degree, speed=30):
+        """向机械臂发送单个关节角度（1~6）。成功返回 None，失败返回错误信息。"""
+        if self.demo or self.mc is None:
+            return None
+        try:
+            self.mc.send_angle(joint_id, degree, speed)
+            return None
+        except Exception as exc:
+            return "{}: {}".format(type(exc).__name__, exc)
+
+    def set_gripper_state(self, flag, speed=50):
+        """夹爪开关：flag 0=打开 / 1=闭合 / 254=释放。成功返回 None，失败返回错误信息。"""
+        if self.demo or self.mc is None:
+            return None
+        try:
+            self.mc.set_gripper_state(flag, speed)
+            return None
+        except Exception as exc:
+            return "{}: {}".format(type(exc).__name__, exc)
+
+    def set_gripper_value(self, value, speed=50):
+        """夹爪精细开度 0~100。成功返回 None，失败返回错误信息。"""
+        if self.demo or self.mc is None:
+            return None
+        try:
+            self.mc.set_gripper_value(int(value), speed)
+            return None
+        except Exception as exc:
+            return "{}: {}".format(type(exc).__name__, exc)
+
+    def get_gripper_value(self):
+        """读取夹爪当前开度；失败返回 None。"""
+        if self.demo or self.mc is None:
+            return None
+        try:
+            v = self.mc.get_gripper_value()
+            if isinstance(v, (int, float)):
+                return int(v)
+            return None
+        except Exception:
+            return None
 
     def close(self):
         try:
@@ -409,6 +460,25 @@ class MonitorApp(tk.Tk):
         self.target_angles = [0.0] * 6     # 最新采样值
         self.pose_angles = [0.0] * 6       # 3D 视图插值后的显示值
         self.active_joint = -1
+
+        # 角度条拖动状态
+        self._bar_dragging = -1      # 正在拖动的关节索引，-1 表示无
+        self._bar_edit = [0.0] * 6   # 拖动过程中的临时目标角度
+
+        # 夹爪状态
+        self.gripper_val = 0         # 当前夹爪开度 0~100（0=闭合，100=张开）
+        self.gripper_label = None    # 夹爪开度显示标签（延迟绑定）
+        self.gripper_canvas = None   # 夹爪进度条画布
+        self._gripper_dragging = False
+
+        # 操作记录与回滚
+        self.sent_angles = [0.0] * 6   # 机械臂当前已知角度快照（用于回滚 before）
+        self.sent_gripper = 0          # 夹爪当前已知开度快照
+        self.op_history = []           # 操作记录列表，每项 dict
+        self.redo_stack = []           # 被撤销的记录，供重做
+        self.op_listbox = None         # 操作记录列表控件（延迟绑定）
+        self.op_count_label = None     # 记录条数显示
+        self.redo_btn = None           # 重做按钮（延迟绑定）
 
         # 视角状态
         self.view_az = math.radians(-35.0)
@@ -565,7 +635,44 @@ class MonitorApp(tk.Tk):
             self.value_labels.append(v)
             c = tk.Canvas(row, width=BAR_W, height=BAR_H, bg=TRACK, highlightthickness=0)
             c.pack(fill="x", pady=(4, 0))
+            # 拖动角度条：按下/拖动更新预览，松开时发送到机械臂
+            c.bind("<ButtonPress-1>", lambda e, idx=i: self._bar_press(e, idx))
+            c.bind("<B1-Motion>", lambda e, idx=i: self._bar_drag(e, idx))
+            c.bind("<ButtonRelease-1>", lambda e, idx=i: self._bar_release(e, idx))
+            c.configure(cursor="sb_h_double_arrow")
             self.bar_canvases.append(c)
+
+        # ---- 夹爪控制（280 M5 自适应夹爪）
+        tk.Label(left, text="夹爪控制", bg=CARD, fg=TEXT,
+                 font=FONT_UI_B).pack(anchor="w", padx=14, pady=(16, 2))
+        gcard = tk.Frame(left, bg="#F8FAFC", highlightthickness=1, highlightbackground=GRID)
+        gcard.pack(fill="x", padx=14, pady=(0, 4))
+
+        ghead = tk.Frame(gcard, bg="#F8FAFC")
+        ghead.pack(fill="x", padx=8, pady=(6, 2))
+        tk.Label(ghead, text="开度", bg="#F8FAFC", fg=MUTED, font=FONT_SMALL).pack(side="left")
+        self.gripper_label = tk.Label(ghead, text="0 %", bg="#F8FAFC", fg=TEXT,
+                                      font=FONT_NUM, width=7, anchor="e")
+        self.gripper_label.pack(side="right")
+
+        self.gripper_canvas = tk.Canvas(gcard, width=BAR_W, height=BAR_H,
+                                        bg=TRACK, highlightthickness=0)
+        self.gripper_canvas.pack(fill="x", padx=8, pady=(2, 6))
+        # 夹爪开度条拖动：0(闭合) 在左，100(张开) 在右
+        self.gripper_canvas.bind("<ButtonPress-1>", self._gripper_press)
+        self.gripper_canvas.bind("<B1-Motion>", self._gripper_drag)
+        self.gripper_canvas.bind("<ButtonRelease-1>", self._gripper_release)
+        self.gripper_canvas.configure(cursor="sb_h_double_arrow")
+
+        gbtn = tk.Frame(gcard, bg="#F8FAFC")
+        gbtn.pack(fill="x", padx=8, pady=(0, 8))
+        tk.Button(gbtn, text="张开", command=lambda: self._gripper_open(), font=FONT_SMALL,
+                  bg="#10B981", fg="white", relief="flat", padx=8).pack(side="left", padx=2)
+        tk.Button(gbtn, text="闭合", command=lambda: self._gripper_close(), font=FONT_SMALL,
+                  bg="#EF4444", fg="white", relief="flat", padx=8).pack(side="left", padx=2)
+        tk.Button(gbtn, text="释放", command=lambda: self._gripper_release_full(), font=FONT_SMALL,
+                  bg="#EDF1F6", fg=TEXT, relief="flat", padx=8).pack(side="left", padx=2)
+        self._draw_gripper_bar()
 
         tk.Label(left, bg=CARD, fg=TEXT, font=FONT_UI_B,
                  text="六轴姿态动画说明").pack(anchor="w", padx=14, pady=(20, 4))
@@ -608,7 +715,8 @@ class MonitorApp(tk.Tk):
         right.grid_columnconfigure(0, weight=1)
         right.grid_rowconfigure(0, weight=0)
         right.grid_rowconfigure(1, weight=0)
-        right.grid_rowconfigure(2, weight=1)   # 多余高度留白，内容顶部对齐
+        right.grid_rowconfigure(2, weight=1)   # 操作记录卡片占据剩余高度
+        right.grid_rowconfigure(3, weight=0)
 
         f1 = tk.Frame(right, bg=CARD, highlightthickness=1, highlightbackground=GRID)
         f1.grid(row=0, column=0, sticky="new", pady=(0, 8))
@@ -623,7 +731,7 @@ class MonitorApp(tk.Tk):
                      font=FONT_SMALL).pack(side="left", padx=6)
 
         f3 = tk.Frame(right, bg=CARD, highlightthickness=1, highlightbackground=GRID)
-        f3.grid(row=1, column=0, sticky="new")
+        f3.grid(row=1, column=0, sticky="new", pady=(0, 8))
         self.f3 = f3
         tk.Label(f3, text="末端坐标（真机，每 5 帧刷新）", bg=CARD, fg=TEXT,
                  font=FONT_UI_B).pack(anchor="w", padx=12, pady=(8, 2))
@@ -639,6 +747,50 @@ class MonitorApp(tk.Tk):
                            width=8, anchor="e")
             lab.grid(row=i // 2, column=(i % 2) * 2 + 1, padx=(0, 8), pady=2, sticky="ew")
             self.coord_labels.append(lab)
+
+        # ---- 操作记录卡片（支持回滚）
+        f4 = tk.Frame(right, bg=CARD, highlightthickness=1, highlightbackground=GRID)
+        f4.grid(row=2, column=0, sticky="nsew", pady=(0, 0))
+        self.op_frame = f4
+        ophead = tk.Frame(f4, bg=CARD)
+        ophead.pack(fill="x", padx=12, pady=(8, 2))
+        tk.Label(ophead, text="操作记录", bg=CARD, fg=TEXT,
+                 font=FONT_UI_B).pack(side="left")
+        self.op_count_label = tk.Label(ophead, text="0 条", bg=CARD, fg=MUTED,
+                                       font=FONT_SMALL)
+        self.op_count_label.pack(side="right")
+
+        # 滚动列表：记录每一次操作
+        oplist = tk.Frame(f4, bg=CARD)
+        oplist.pack(fill="both", expand=True, padx=8, pady=(0, 4))
+        self.op_listbox = tk.Listbox(oplist, bg="#F8FAFC", fg=TEXT, font=FONT_SMALL,
+                                     height=6, relief="flat", highlightthickness=0,
+                                     activestyle="none", exportselection=False)
+        opsb = ttk.Scrollbar(oplist, orient="vertical", command=self.op_listbox.yview)
+        self.op_listbox.configure(yscrollcommand=opsb.set)
+        self.op_listbox.pack(side="left", fill="both", expand=True)
+        opsb.pack(side="right", fill="y")
+
+        opbtn = tk.Frame(f4, bg=CARD)
+        opbtn.pack(fill="x", padx=8, pady=(0, 8))
+        tk.Button(opbtn, text="撤销上一步", command=self._rollback, font=FONT_SMALL,
+                  bg="#F59E0B", fg="white", relief="flat", padx=8).pack(side="left", padx=2)
+        self.redo_btn = tk.Button(opbtn, text="重做", command=self._redo, font=FONT_SMALL,
+                                  bg="#10B981", fg="white", relief="flat", padx=8)
+        self.redo_btn.pack(side="left", padx=2)
+        self.redo_btn.config(state="disabled", bg="#C7CDD6")   # 初始无重做内容
+        tk.Button(opbtn, text="清空记录", command=self._clear_ops, font=FONT_SMALL,
+                  bg="#EDF1F6", fg=TEXT, relief="flat", padx=8).pack(side="left", padx=2)
+
+        # 第二行：回退到选中处 / 从选中处重放（两个独立按钮）
+        opbtn2 = tk.Frame(f4, bg=CARD)
+        opbtn2.pack(fill="x", padx=8, pady=(0, 8))
+        tk.Label(opbtn2, text="点击列表选中一条，然后回退或重放",
+                 bg=CARD, fg=MUTED, font=FONT_TINY).pack(side="left")
+        tk.Button(opbtn2, text="从选中处重放", command=self._replay_from_selection,
+                  font=FONT_SMALL, bg="#8B5CF6", fg="white", relief="flat", padx=6).pack(side="right", padx=2)
+        tk.Button(opbtn2, text="回退到选中处", command=self._rollback_to_selection,
+                  font=FONT_SMALL, bg="#F59E0B", fg="white", relief="flat", padx=6).pack(side="right", padx=2)
 
     def _build_status(self):
         bar = tk.Frame(self, bg=CARD, highlightthickness=1, highlightbackground=GRID)
@@ -661,27 +813,32 @@ class MonitorApp(tk.Tk):
 
     # ---- 尺寸自适应
     def _on_host_configure(self, evt):
-        """3D 演示独占纵列并铺满主区高度；窗口过矮时保持自然高度并启用滚动。"""
+        """3D 演示独占纵列并铺满主区高度；窗口过矮时保持自然高度并启用滚动。
+
+        高度基准：以窗口可用高度为准，body 填满可用空间，pose 填满中列，
+        三列底部对齐；内容（左列）自然高度超过可用空间时出现滚动条。
+        """
         w = max(evt.width, 840)          # 三列 minsize 合计
         avail = max(300, evt.height)
-        h_pose = max(220, avail - POSE_CHROME)
-        h_trend = max(70, avail - RIGHT_CHROME)   # 右列同样铺满，三列底边对齐
-        self.pose.configure(height=h_pose)
+        # 左列内容自然高度（固定 pack 布局，稳定；动态测量兜底）
+        left_natural = max(LEFT_REQ_SHORT if (evt.height < 620) else LEFT_REQ_FULL,
+                           self.left_frame.winfo_reqheight())
+        # body 高度 = 可用高度与内容自然高度的较大者
+        h = max(avail, left_natural, BODY_MIN_H)
+        # 趋势卡片固定较小高度，剩余空间留给操作记录卡片（可滚动）
+        h_trend = max(70, min(150, h - RIGHT_CHROME))
         self.trend.configure(height=h_trend)
+        # 3D 画布按 body 最终高度填充，保证三列底边对齐
+        self.pose.configure(height=max(220, h - POSE_CHROME))
+        self.host_canvas.itemconfig(self._body_win, width=w, height=h)
+        self.host_canvas.configure(scrollregion=(0, 0, w, h))
         compact = (evt.height < 620) or (self.left_frame.winfo_width() < 320)
         if compact != self._tip_compact:
             self._tip_compact = compact
             self.tip_label.configure(
                 text=(self.profile.tip_short or TIP_SHORT) if compact
                 else (self.profile.tip_full or TIP_FULL))
-        # 新增：用左列真实请求高度兜底（型号选择卡加入后左列内容更高）
-        need_h = max(BODY_MIN_H, POSE_CHROME + h_pose, RIGHT_CHROME + h_trend,
-                     LEFT_REQ_SHORT if compact else LEFT_REQ_FULL,
-                     self.left_frame.winfo_reqheight())
-        h = max(evt.height, need_h)
-        self.host_canvas.itemconfig(self._body_win, width=w, height=h)
-        self.host_canvas.configure(scrollregion=(0, 0, w, h))
-        show = need_h > evt.height + 2
+        show = h > evt.height + 2
         if show != self._vsb_visible:
             if show:
                 self.vsb.pack(side="right", fill="y", before=self.host_canvas)
@@ -710,20 +867,6 @@ class MonitorApp(tk.Tk):
                                self.profile.display_limit)
         self._draw_pose(self.pose_angles, self.active_joint)
         self._fit_snap = False
-
-        # 实测兜底：布局稳定后按控件真实请求高度校正，杜绝估算偏差造成的裁切
-        try:
-            req = max(BODY_MIN_H, self.body.winfo_reqheight())
-            host_h = self.host_canvas.winfo_height()
-            if req > host_h + 2:
-                self.host_canvas.itemconfig(self._body_win, height=req)
-                w = max(self.host_canvas.winfo_width(), 700)
-                self.host_canvas.configure(scrollregion=(0, 0, w, req))
-                if not self._vsb_visible:
-                    self.vsb.pack(side="right", fill="y", before=self.host_canvas)
-                    self._vsb_visible = True
-        except Exception:
-            pass
 
     # ---- 交互
     def scan_ports(self):
@@ -900,11 +1043,15 @@ class MonitorApp(tk.Tk):
                 self.profile.baud))
             return
         self.target_angles = list(angles)
+        # 同步机械臂实际角度快照（用于操作回滚的 before 值）
+        self.sent_angles = list(angles)
         self.history.append(angles)
         if len(self.history) > HISTORY:
             self.history.pop(0)
 
         for i, val in enumerate(angles):
+            if i == self._bar_dragging:
+                continue          # 正在拖动的关节保留拖动预览，不被读回值覆盖
             self.value_labels[i].config(text="{:+.2f}".format(val))
             self._draw_bar(self.bar_canvases[i], val, JOINT_COLORS[i],
                            self.profile.display_limit)
@@ -943,6 +1090,345 @@ class MonitorApp(tk.Tk):
         if x1 - x0 > 0.5:
             c.create_rectangle(x0, 2, x1, h - 2, fill=color, outline="")
         c.create_line(mid, 0, mid, h, fill="#AAB2BF")
+
+    def _bar_x_to_angle(self, idx, x):
+        """把角度条上的鼠标 x 坐标换算为角度值（按当前型号量程）。"""
+        c = self.bar_canvases[idx]
+        w = c.winfo_width() or BAR_W
+        limit = self.profile.display_limit
+        mid = w / 2
+        frac = (x - mid) / max(1.0, (mid - 3))
+        return max(-limit, min(limit, frac * limit))
+
+    def _bar_press(self, evt, idx):
+        self._bar_dragging = idx
+        self._bar_edit[idx] = self._bar_x_to_angle(idx, evt.x)
+        self._draw_bar(self.bar_canvases[idx], self._bar_edit[idx],
+                       JOINT_COLORS[idx], self.profile.display_limit)
+        self.value_labels[idx].config(text="{:+.2f}".format(self._bar_edit[idx]))
+
+    def _bar_drag(self, evt, idx):
+        if self._bar_dragging != idx:
+            return
+        self._bar_edit[idx] = self._bar_x_to_angle(idx, evt.x)
+        self._draw_bar(self.bar_canvases[idx], self._bar_edit[idx],
+                       JOINT_COLORS[idx], self.profile.display_limit)
+        self.value_labels[idx].config(text="{:+.2f}".format(self._bar_edit[idx]))
+        # 实时驱动 3D 姿态预览
+        self.target_angles[idx] = self._bar_edit[idx]
+        self.pose_angles[idx] = self._bar_edit[idx]
+
+    def _bar_release(self, evt, idx):
+        if self._bar_dragging != idx:
+            return
+        self._bar_dragging = -1
+        new_val = self._bar_x_to_angle(idx, evt.x)
+        self._bar_edit[idx] = new_val
+        self._draw_bar(self.bar_canvases[idx], new_val,
+                       JOINT_COLORS[idx], self.profile.display_limit)
+        self.value_labels[idx].config(text="{:+.2f}".format(new_val))
+        self.target_angles[idx] = new_val
+        self.pose_angles[idx] = new_val
+
+        # 记录本次拖动操作（无论演示/真机都记录，便于回滚与审计）
+        before = self.sent_angles[idx]
+        if abs(new_val - before) > 0.01:
+            self._record_op("angle", before, new_val, joint_id=idx + 1)
+            self.sent_angles[idx] = new_val
+
+        # 真机模式：松开后发送到机械臂
+        if not self.demo_var.get() and self.reader is not None:
+            res = self.reader.source.send_angle(idx + 1, new_val)
+            if res is not None:
+                self._set_status("发送 J{} -> {:+.2f}°：{}".format(
+                    idx + 1, new_val, res))
+
+    # ---- 夹爪控制
+    def _draw_gripper_bar(self):
+        """重绘夹爪开度条（0 在左=闭合，100 在右=张开）。"""
+        c = self.gripper_canvas
+        if c is None:
+            return
+        c.delete("all")
+        w = c.winfo_width() or BAR_W
+        h = c.winfo_height() or BAR_H
+        c.create_rectangle(0, 0, w, h, fill=TRACK, outline="")
+        frac = max(0.0, min(1.0, self.gripper_val / 100.0))
+        x = frac * w
+        if x > 1:
+            c.create_rectangle(0, 2, x, h - 2, fill="#3B82F6", outline="")
+        c.create_line(0, 0, 0, h, fill="#AAB2BF")   # 左端刻度：闭合
+        c.create_line(w - 1, 0, w - 1, h, fill="#AAB2BF")  # 右端刻度：张开
+
+    def _gripper_x_to_value(self, x):
+        """夹爪条 x 坐标 -> 开度 0~100。"""
+        w = self.gripper_canvas.winfo_width() or BAR_W
+        return max(0, min(100, int(round(x / max(1.0, w) * 100.0))))
+
+    def _gripper_press(self, evt):
+        self._gripper_dragging = True
+        self._apply_gripper_value(self._gripper_x_to_value(evt.x))
+
+    def _gripper_drag(self, evt):
+        if getattr(self, "_gripper_dragging", False):
+            self._apply_gripper_value(self._gripper_x_to_value(evt.x))
+
+    def _gripper_release(self, evt):
+        if not getattr(self, "_gripper_dragging", False):
+            return
+        self._gripper_dragging = False
+        val = self._gripper_x_to_value(evt.x)
+        self._apply_gripper_value(val)
+        # 松开后发送精细开度到机械臂
+        self._gripper_send_value(val)
+
+    def _apply_gripper_value(self, val):
+        """更新夹爪开度显示（本地）。"""
+        self.gripper_val = val
+        if self.gripper_label is not None:
+            self.gripper_label.config(text="{} %".format(val))
+        self._draw_gripper_bar()
+
+    def _gripper_send_value(self, val):
+        # 记录操作（无论演示/真机）
+        before = self.sent_gripper
+        if abs(val - before) > 0:
+            self._record_op("gripper", before, val)
+            self.sent_gripper = val
+        if self.demo_var.get() or self.reader is None:
+            self._set_status("夹爪开度 {} %（演示模式，未发送）".format(val))
+            return
+        res = self.reader.source.set_gripper_value(val)
+        self._set_status("夹爪开度 {} %：{}".format(val, "已发送" if res is None else res))
+
+    def _gripper_open(self):
+        self._apply_gripper_value(100)
+        before = self.sent_gripper
+        if abs(100 - before) > 0:
+            self._record_op("gripper", before, 100)
+            self.sent_gripper = 100
+        if self.demo_var.get() or self.reader is None:
+            self._set_status("夹爪张开（演示模式，未发送）")
+            return
+        res = self.reader.source.set_gripper_state(0)
+        self._set_status("夹爪张开：{}".format("已发送" if res is None else res))
+
+    def _gripper_close(self):
+        self._apply_gripper_value(0)
+        before = self.sent_gripper
+        if abs(0 - before) > 0:
+            self._record_op("gripper", before, 0)
+            self.sent_gripper = 0
+        if self.demo_var.get() or self.reader is None:
+            self._set_status("夹爪闭合（演示模式，未发送）")
+            return
+        res = self.reader.source.set_gripper_state(1)
+        self._set_status("夹爪闭合：{}".format("已发送" if res is None else res))
+
+    def _gripper_release_full(self):
+        if self.demo_var.get() or self.reader is None:
+            self._set_status("夹爪释放（演示模式，未发送）")
+            return
+        res = self.reader.source.set_gripper_state(254)
+        self._set_status("夹爪释放：{}".format("已发送" if res is None else res))
+
+    # ---- 操作记录与回滚
+    def _record_op(self, kind, before, after, joint_id=None):
+        """记录一次操作。
+
+        kind='angle'：before/after 为角度值，joint_id 为关节号 1~6；
+        kind='gripper'：before/after 为夹爪开度 0~100。
+        """
+        rec = {
+            "time": time.strftime("%H:%M:%S"),
+            "kind": kind,
+            "before": before,
+            "after": after,
+            "joint_id": joint_id,
+        }
+        self.op_history.append(rec)
+        # 新操作使重做链失效
+        self.redo_stack.clear()
+        self._update_redo_btn()
+        # 限制记录条数，避免无限增长
+        if len(self.op_history) > 200:
+            self.op_history.pop(0)
+        self._refresh_op_list()
+
+    def _refresh_op_list(self):
+        if self.op_listbox is None:
+            return
+        self.op_listbox.delete(0, "end")
+        for rec in self.op_history:
+            if rec["kind"] == "gripper":
+                txt = "{}  夹爪  {}% -> {}%".format(
+                    rec["time"], rec["before"], rec["after"])
+            else:
+                txt = "{}  J{}  {:.1f}° -> {:.1f}°".format(
+                    rec["time"], rec["joint_id"], rec["before"], rec["after"])
+            self.op_listbox.insert("end", txt)
+        # 滚动到底部，显示最新
+        self.op_listbox.yview_moveto(1.0)
+        if self.op_count_label is not None:
+            self.op_count_label.config(text="{} 条".format(len(self.op_history)))
+
+    def _rollback(self):
+        """撤销最后一步操作：恢复对应关节/夹爪到操作前的值。"""
+        if not self.op_history:
+            self._set_status("没有可撤销的操作")
+            return
+        rec = self.op_history.pop()
+        self.redo_stack.append(rec)
+        self._update_redo_btn()
+        if self.demo_var.get() or self.reader is None:
+            # 演示/无驱动：仅本地恢复显示，不发送指令
+            self._apply_local_value(rec, rec["before"])
+            self._set_status("已回滚 {}（演示模式，未发送）".format(self._fmt_op(rec)))
+            self._refresh_op_list()
+            return
+        if self._apply_op_value(rec, rec["before"]):
+            self._set_status("已回滚 " + self._fmt_op(rec))
+        self._refresh_op_list()
+
+    def _redo(self):
+        """重做刚撤销的一步：重新应用 after 值。"""
+        if not self.redo_stack:
+            self._set_status("没有可重做的操作")
+            return
+        rec = self.redo_stack.pop()
+        if self.demo_var.get() or self.reader is None:
+            # 演示/无驱动：仅本地恢复显示，不发送指令
+            self.op_history.append(rec)
+            self._apply_local_value(rec, rec["after"])
+            self._set_status("已重做 {}（演示模式，未发送）".format(self._fmt_op(rec)))
+            self._update_redo_btn()
+            self._refresh_op_list()
+            return
+        if self._apply_op_value(rec, rec["after"]):
+            # 重做成功后重新纳入操作记录
+            self.op_history.append(rec)
+            self._set_status("已重做 " + self._fmt_op(rec))
+        self._update_redo_btn()
+        self._refresh_op_list()
+
+    def _apply_local_value(self, rec, target):
+        """仅更新本地界面显示（角度条/3D 姿态/夹爪条），不发送指令。"""
+        if rec["kind"] == "gripper":
+            self.sent_gripper = int(target)
+            self._apply_gripper_value(int(target))
+            return
+        joint_id = rec["joint_id"]
+        self.sent_angles[joint_id - 1] = target
+        self.target_angles[joint_id - 1] = target
+        self.pose_angles[joint_id - 1] = target
+        self.value_labels[joint_id - 1].config(text="{:+.2f}".format(target))
+        self._draw_bar(self.bar_canvases[joint_id - 1], target,
+                       JOINT_COLORS[joint_id - 1], self.profile.display_limit)
+
+    def _apply_op_value(self, rec, target):
+        """把 rec 对应关节/夹爪驱动到 target 值（发送指令 + 更新界面）。成功返回 True。"""
+        if rec["kind"] == "gripper":
+            res = self.reader.source.set_gripper_value(int(target))
+            if res is None:
+                self._apply_local_value(rec, target)
+                return True
+            self._set_status("夹爪操作失败：{}".format(res))
+            return False
+        joint_id = rec["joint_id"]
+        res = self.reader.source.send_angle(joint_id, target)
+        if res is None:
+            self._apply_local_value(rec, target)
+            return True
+        self._set_status("J{} 操作失败：{}".format(joint_id, res))
+        return False
+
+    def _update_redo_btn(self):
+        """根据重做栈是否为空，启用/禁用重做按钮。"""
+        if self.redo_btn is None:
+            return
+        if self.redo_stack:
+            self.redo_btn.config(state="normal", bg="#10B981")
+        else:
+            self.redo_btn.config(state="disabled", bg="#C7CDD6")
+
+    def _fmt_op(self, rec):
+        if rec["kind"] == "gripper":
+            return "夹爪 {}% -> {}%".format(rec["before"], rec["after"])
+        return "J{} {:.1f}° -> {:.1f}°".format(
+            rec["joint_id"], rec["before"], rec["after"])
+
+    def _clear_ops(self):
+        self.op_history.clear()
+        self.redo_stack.clear()
+        self._update_redo_btn()
+        self._refresh_op_list()
+        self._set_status("已清空操作记录")
+
+    def _get_selection_index(self):
+        """读取列表选中项索引；无记录/未选中时给出提示并返回 None。"""
+        if not self.op_history:
+            self._set_status("没有操作记录")
+            return None
+        sel = self.op_listbox.curselection()
+        if not sel:
+            self._set_status("请先在操作记录列表里点击选中一条记录")
+            return None
+        return sel[0]
+
+    def _rollback_to_selection(self):
+        """回退到选中处：撤销选中步及之后的所有操作，回到该步之前的状态。"""
+        index = self._get_selection_index()
+        if index is None:
+            return
+        self._rollback_to(index)
+
+    def _replay_from_selection(self):
+        """从选中处重放：顺序重放选中步及之后的所有操作。"""
+        index = self._get_selection_index()
+        if index is None:
+            return
+        self._replay_from(index)
+
+    def _rollback_to(self, index):
+        """逆序撤销 index..n-1 步，回到「第 index 步之前」的状态。"""
+        n = len(self.op_history)
+        if index < 0 or index >= n:
+            self._set_status("选中的记录不存在")
+            return
+        demo = self.demo_var.get() or self.reader is None
+        for j in range(n - 1, index - 1, -1):
+            rec = self.op_history[j]
+            if demo:
+                self._apply_local_value(rec, rec["before"])
+            else:
+                if not self._apply_op_value(rec, rec["before"]):
+                    self._set_status("回退到第 {} 步失败，已中止".format(j + 1))
+                    return
+        if demo:
+            self._set_status("已回退到第 {} 步之前（演示模式，未发送）".format(index + 1))
+        else:
+            self._set_status("已回退到第 {} 步之前".format(index + 1))
+
+    def _replay_from(self, index):
+        """顺序重放 index..n-1 步的 after 值。"""
+        n = len(self.op_history)
+        if index < 0 or index >= n:
+            self._set_status("选中的记录不存在")
+            return
+        demo = self.demo_var.get() or self.reader is None
+        for j in range(index, n):
+            rec = self.op_history[j]
+            if demo:
+                self._apply_local_value(rec, rec["after"])
+            else:
+                if not self._apply_op_value(rec, rec["after"]):
+                    self._set_status("重放第 {} 步失败，已中止".format(j + 1))
+                    return
+        if demo:
+            self._set_status("已从第 {} 步重放 {} 步（演示模式，未发送）".format(
+                index + 1, n - index))
+        else:
+            self._set_status("已从第 {} 步重放 {} 步".format(index + 1, n - index))
 
     def _draw_trend(self):
         c = self.trend
