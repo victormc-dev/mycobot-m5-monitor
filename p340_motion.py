@@ -42,6 +42,15 @@ MODE_REL = "rel"         # G91 相对坐标（默认）
 MODE_ABS = "abs"         # G90 绝对坐标（备用：个别固件把 M10 当绝对角时切这里）
 MODE_LABELS = {MODE_REL: "相对 G91", MODE_ABS: "绝对 G90"}
 
+# 外设 / 使能指令。官方《吸泵使用》原文：
+#   「set_gpio_state(state)：输入 0 表示开启吸泵，输入 1 表示关闭吸泵」
+# 驱动的 set_gpio_state() 把 0 映射到 M22(GPIO_ON)、1 映射到 M23(GPIO_CLOSE)，
+# 这里直接发 G-code，绕开驱动 _respone() 在队列积压时的 while True 死等。
+PUMP_ON_CMD = "M22"
+PUMP_OFF_CMD = "M23"
+LOCK_CMD = "M18"         # LOCK_SERVOS：步进电机使能，保持力矩（手推不动）
+RELEASE_CMD = "M17"      # RELEASE_SERVOS：掉电松轴，可手推示教（位置随即失效）
+
 
 class MotionRejected(Exception):
     """指令被门禁拒绝：未回零 / 超限 / 增量过小 / 轴号非法。"""
@@ -162,6 +171,47 @@ def g28(robot, timeout=HOME_TIMEOUT, expect="ok"):
     return False
 
 
+def send(robot, command, timeout=0.6):
+    """直接写一条 G-code，最多等 timeout 收 ok；写入成功即返回 True。
+
+    不用驱动的 set_gpio_state()/power_on()：它们内部的 _respone() 在队列积压
+    （queue_size > 90）时会 `while True` 死等，把采集线程卡死。吸泵与锁轴都是
+    即时指令，没应答也不影响功能，因此这里只保证发出、尽量读回。
+    """
+    ser = getattr(robot, "_serial_port", None)
+    if ser is None:
+        return False
+    try:
+        ser.reset_input_buffer()
+        ser.write(command + "\r")
+        ser.flush()
+    except Exception:
+        return False
+    buf = ""
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        try:
+            pending = ser.inWaiting()
+            if pending:
+                buf += ser.read(pending).decode("utf-8", "ignore")
+                if "ok" in buf.lower():
+                    break
+        except Exception:
+            break
+        time.sleep(0.02)
+    return True
+
+
+def set_pump(robot, on, timeout=0.6):
+    """吸泵开关：官方 set_gpio_state(0)=开 / (1)=关。"""
+    return send(robot, PUMP_ON_CMD if on else PUMP_OFF_CMD, timeout)
+
+
+def set_lock(robot, on, timeout=0.6):
+    """阻尼锁定：M18 使能锁轴（保持力矩），M17 掉电松轴（可手推示教）。"""
+    return send(robot, LOCK_CMD if on else RELEASE_CMD, timeout)
+
+
 def switch_state(robot, timeout=0.8):
     """读取回零限位开关状态（M119）；无应答返回 None。用于回零后的复核提示。"""
     text = _query(robot, "M119", "ENDSTOP", timeout)
@@ -242,6 +292,8 @@ class _FakeSerial:
         if not self.answer:
             return
         if "G28" in cmd:
+            self.inbuf = "ok\r"
+        elif cmd.strip() in ("M22", "M23", "M17", "M18"):
             self.inbuf = "ok\r"
         elif "M114" in cmd:
             self.inbuf = "COORDS[205.0,0.0,-40.0,0.0]\r\n"
@@ -358,7 +410,16 @@ def motion_selftest():
     assert read_coords(_FakeRobot(False), timeout=0.3) is None
     assert time.time() - t0 < 2.0, "查询超时实现退化为长阻塞"
 
-    # 8) 模式切换
+    # 8) 吸泵 / 锁轴指令：必须落在官方 G-code 上
+    robot = _FakeRobot(True)
+    assert set_pump(robot, True) is True
+    assert set_pump(robot, False) is True
+    assert set_lock(robot, True) is True
+    assert set_lock(robot, False) is True
+    writes = [w.strip() for w in robot._serial_port.writes]
+    assert writes == ["M22", "M23", "M18", "M17"], "外设指令错误: {}".format(writes)
+
+    # 9) 模式切换
     for mode in (MODE_REL, MODE_ABS):
         m2.set_mode(mode)
         assert m2.mode == mode
@@ -366,7 +427,9 @@ def motion_selftest():
 
 
 __all__ = [
-    "DEFAULT_SPEED", "HOME_TIMEOUT", "MAX_STEP_DEG", "MIN_STEP_DEG",
+    "DEFAULT_SPEED", "HOME_TIMEOUT", "LOCK_CMD", "MAX_STEP_DEG", "MIN_STEP_DEG",
     "MODE_ABS", "MODE_LABELS", "MODE_REL", "MotionRejected", "P340Motion",
-    "g28", "motion_selftest", "read_angles", "read_coords", "switch_state",
+    "PUMP_OFF_CMD", "PUMP_ON_CMD", "RELEASE_CMD",
+    "g28", "motion_selftest", "read_angles", "read_coords", "send",
+    "set_lock", "set_pump", "switch_state",
 ]

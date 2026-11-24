@@ -48,7 +48,6 @@ HISTORY = 120
 L1, L2 = 110.0, 95.0        # 平面姿态示意连杆长度（可视化，非真实 mm）
 BASE_H = 26.0
 POSE_CHROME = 210           # 中间卡除画布外的固定高度（标题+模式行+脚注+边距）
-TREND_CHROME = 232          # 右侧趋势卡除画布外的固定高度
 
 # 与主界面「动作」下拉一致，四个预设全部提供 P340 四轴版
 DEMO_PRESETS = ("自由摆动", "逐关节演示", "抓取循环", "归零静止")
@@ -324,6 +323,19 @@ class _P340Source:
         elif kind == "power":
             self.robot.power_on()
             self.report("全部关节已上电")
+        elif kind == "pump":
+            if not motion_mod.set_pump(self.robot, bool(payload)):
+                self.report("吸泵指令下发失败（串口无响应）")
+                return
+            self.report("吸泵已{}".format("开启" if payload else "关闭"))
+        elif kind == "lock":
+            if not motion_mod.set_lock(self.robot, bool(payload)):
+                self.report("锁轴指令下发失败（串口无响应）")
+                return
+            if not payload:
+                self.motion.reset("已松轴：位置未知，需重新回零")
+            self.report("阻尼锁定：{}".format(
+                "已锁定（M18 保持力矩）" if payload else "已松轴（M17 可手推，位置失效）"))
 
     def _exec_demo(self, kind, payload):
         """演示模式下这些指令只做本地状态迁移，不涉及硬件。"""
@@ -333,6 +345,16 @@ class _P340Source:
         elif kind == "release":
             self.motion.reset("演示模式：已模拟松轴")
             self.report("演示模式：已模拟松轴（需重新回零）")
+        elif kind == "pump":
+            self.report("演示模式：吸泵{}".format("开启" if payload else "关闭"))
+        elif kind == "lock":
+            if not payload:
+                self.motion.reset("演示模式：已模拟松轴")
+            self.report("演示模式：阻尼锁定{}".format("开" if payload else "关（松轴）"))
+        elif kind == "send":
+            axis, target, _delta = payload
+            self.motion.commit(axis, target)
+            self.report("演示模式：J{} 模型更新到 {:+.2f}°".format(axis + 1, target))
 
     def _do_home(self):
         self.report("回零中（G28），约 10-20 秒，请勿触碰机械臂…")
@@ -419,11 +441,21 @@ class P340Panel(tk.Frame):
         self.source = None                # 采集线程内的数据源，用于入队指令
         self.mode_var = tk.StringVar(value=motion_mod.MODE_REL)
         self.speed_var = tk.IntVar(value=motion_mod.DEFAULT_SPEED)
+        # 外设与使能状态（真机由串口回报确认，演示模式仅本地切换）
+        self.pump_on = False             # 吸泵：M22 开 / M23 关
+        self.lock_on = True              # 阻尼锁定：M18 锁轴 / M17 松轴
+        # 操作记录与回放
+        self.ops = []                    # 已执行记录，末尾为最新
+        self.redo_ops = []               # 被撤销的记录，供重做
+        self.op_list = None
+        self.op_count_label = None
+        self.redo_btn = None
         # 角度条拖动状态
         self._bar_dragging = -1
         self._bar_edit = [0.0] * self.profile.max_joints
         self._hint_shown = True          # 矮窗口下隐藏底部操作提示，避免被裁切
         self._dense = False              # 矮窗口下压缩关节行间距
+        self._coord_shown = True         # 矮窗口下隐藏末端坐标卡，让位给操作记录
         self._resize_job = None
         self.pose_mode = tk.StringVar(value="3d")          # 3D 姿态 / 2D 侧视
         self.view_az = math.radians(-35.0)
@@ -453,6 +485,7 @@ class P340Panel(tk.Frame):
     def _build(self):
         head = tk.Frame(self, bg=CARD, highlightthickness=1, highlightbackground=GRID)
         head.pack(fill="x", padx=10, pady=(10, 6))
+        self.head = head
         top = tk.Frame(head, bg=CARD)
         top.pack(fill="x")
         tk.Label(top, text="ultraArm P340 · 四轴码垛步进机械臂监控", bg=CARD, fg=TEXT,
@@ -478,12 +511,14 @@ class P340Panel(tk.Frame):
                                   font=FONT_UI_B, bg="#2563EB", fg="white",
                                   relief="flat", padx=10, pady=1)
         self.home_btn.pack(side="left", padx=(12, 2))
-        tk.Button(ctl, text="松轴示教", command=lambda: self._submit("release"),
-                  font=FONT_SMALL, bg="#EDF1F6", fg=TEXT, relief="flat",
-                  padx=8, pady=1).pack(side="left", padx=2)
-        tk.Button(ctl, text="上电", command=lambda: self._submit("power"),
-                  font=FONT_SMALL, bg="#EDF1F6", fg=TEXT, relief="flat",
-                  padx=8, pady=1).pack(side="left", padx=2)
+        # 阻尼锁定：M18 使能锁轴（保持力矩）/ M17 掉电松轴（可手推示教）
+        self.lock_btn = tk.Button(ctl, text="阻尼锁定", command=self._toggle_lock,
+                                  font=FONT_SMALL, relief="flat", padx=8, pady=1)
+        self.lock_btn.pack(side="left", padx=2)
+        # 吸泵：M22 开 / M23 关（官方 set_gpio_state(0/1)）
+        self.pump_btn = tk.Button(ctl, text="吸泵", command=self._toggle_pump,
+                                  font=FONT_SMALL, relief="flat", padx=8, pady=1)
+        self.pump_btn.pack(side="left", padx=2)
         tk.Label(ctl, text="运动", bg=CARD, fg=MUTED, font=FONT_SMALL).pack(
             side="left", padx=(12, 2))
         for label, val in ((motion_mod.MODE_LABELS[motion_mod.MODE_REL], motion_mod.MODE_REL),
@@ -500,6 +535,7 @@ class P340Panel(tk.Frame):
 
         body = tk.Frame(self, bg=BG)
         body.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        self.body = body
         body.grid_columnconfigure(0, weight=2, minsize=250)
         body.grid_columnconfigure(1, weight=5, minsize=330)
         body.grid_columnconfigure(2, weight=3, minsize=250)
@@ -570,15 +606,17 @@ class P340Panel(tk.Frame):
         tk.Label(mid, text="拖动旋转 / 滚轮缩放 / 双击复位；几何示意，非精确 DH 解算",
                  bg=CARD, fg=MUTED, font=FONT_SMALL).pack(anchor="w", padx=12, pady=(0, 10))
 
-        # 右：趋势 + 末端坐标
+        # 右：趋势 + 末端坐标 + 操作记录（记录卡吃剩余高度）
         right = tk.Frame(body, bg=BG)
         right.grid(row=0, column=2, sticky="nsew")
+        right.grid_columnconfigure(0, weight=1)
+        right.grid_rowconfigure(2, weight=1)
         f1 = tk.Frame(right, bg=CARD, highlightthickness=1, highlightbackground=GRID)
-        f1.pack(fill="both", expand=True, pady=(0, 8))
+        f1.grid(row=0, column=0, sticky="ew", pady=(0, 8))
         tk.Label(f1, text="角度趋势（最近 {} 帧）".format(HISTORY), bg=CARD, fg=TEXT,
                  font=FONT_UI_B).pack(anchor="w", padx=12, pady=(8, 2))
-        self.trend = tk.Canvas(f1, width=230, height=190, bg=CARD, highlightthickness=0)
-        self.trend.pack(fill="both", expand=True, padx=12, pady=(0, 2))
+        self.trend = tk.Canvas(f1, width=230, height=150, bg=CARD, highlightthickness=0)
+        self.trend.pack(fill="x", padx=12, pady=(0, 2))
         legend = tk.Frame(f1, bg=CARD)
         legend.pack(pady=(0, 8))
         self.legend_labels = []
@@ -589,7 +627,8 @@ class P340Panel(tk.Frame):
             self.legend_labels.append(lab)
 
         f2 = tk.Frame(right, bg=CARD, highlightthickness=1, highlightbackground=GRID)
-        f2.pack(fill="x")
+        f2.grid(row=1, column=0, sticky="ew")
+        self.coord_card = f2
         tk.Label(f2, text="末端坐标（真机，每 5 帧刷新）", bg=CARD, fg=TEXT,
                  font=FONT_UI_B).pack(anchor="w", padx=12, pady=(8, 2))
         grid = tk.Frame(f2, bg=CARD)
@@ -602,30 +641,78 @@ class P340Panel(tk.Frame):
                            font=("Consolas", 10), width=9, anchor="e")
             lab.grid(row=i // 2, column=(i % 2) * 2 + 1, padx=(0, 8), pady=2, sticky="ew")
             self.coord_labels.append(lab)
+
+        # 操作记录卡：关节增量 / 吸泵 / 锁定都留痕，可撤销与重做
+        self.op_card = tk.Frame(right, bg=CARD, highlightthickness=1, highlightbackground=GRID)
+        self.op_card.grid(row=2, column=0, sticky="nsew", pady=(8, 0))
+        ophead = tk.Frame(self.op_card, bg=CARD)
+        ophead.pack(fill="x", padx=12, pady=(8, 2))
+        tk.Label(ophead, text="操作记录", bg=CARD, fg=TEXT,
+                 font=FONT_UI_B).pack(side="left")
+        tk.Button(ophead, text="清空", command=self._clear_ops, font=FONT_TINY,
+                  bg="#EDF1F6", fg=TEXT, relief="flat", padx=6,
+                  pady=0).pack(side="right")
+        self.op_count_label = tk.Label(ophead, text="0 条", bg=CARD, fg=MUTED,
+                                       font=FONT_TINY)
+        self.op_count_label.pack(side="right", padx=6)
+        lbwrap = tk.Frame(self.op_card, bg=CARD)
+        lbwrap.pack(fill="both", expand=True, padx=12, pady=(0, 2))
+        self.op_list = tk.Listbox(lbwrap, height=5, font=FONT_SMALL, bg="#F8FAFC",
+                                  fg=TEXT, relief="flat", borderwidth=0,
+                                  highlightthickness=0, activestyle="none",
+                                  selectbackground="#DBEAFE", selectforeground=TEXT)
+        opsb = ttk.Scrollbar(lbwrap, orient="vertical", command=self.op_list.yview)
+        self.op_list.configure(yscrollcommand=opsb.set)
+        opsb.pack(side="right", fill="y")
+        self.op_list.pack(side="left", fill="both", expand=True)
+        opbtn = tk.Frame(self.op_card, bg=CARD)
+        opbtn.pack(fill="x", padx=12, pady=(2, 8))
+        self.undo_btn = tk.Button(opbtn, text="撤销上一步", command=self._rollback,
+                                  font=FONT_SMALL, bg="#EDF1F6", fg=TEXT,
+                                  relief="flat", padx=8, pady=1)
+        self.undo_btn.pack(side="left")
+        self.redo_btn = tk.Button(opbtn, text="重做", command=self._redo,
+                                  font=FONT_SMALL, bg="#EDF1F6", fg=TEXT,
+                                  relief="flat", padx=8, pady=1)
+        self.redo_btn.pack(side="left", padx=4)
         self.bind("<Configure>", self._on_resize)
+        self._paint_toggles()
+        self._refresh_ops()
 
     def fit_height(self, avail):
-        """按宿主可用高度重排两个画布。
+        """按宿主可用高度重排画布。
 
         P340 面板是画布宿主里的 window item，若只靠自然高度，画布会按内容请求
-        尺寸不断长大、把纵向滚动条顶出来（1226 级“棘轮”）。这里显式给定高度：
-        中间 3D 卡与右侧趋势卡各自铺满，卡片其余部分的高度由 chrome 常量扣除。
+        尺寸不断长大、把纵向滚动条顶出来（“棘轮”）。这里显式给定高度：
+        先扣掉头部卡片的实际请求高度（新增了吸泵/锁定开关，行数会变），
+        剩余给 body；右列三张卡中只有操作记录跟随剩余高度伸缩。
         """
         avail = max(360, int(avail))
-        self.pose.configure(height=max(200, avail - POSE_CHROME))
-        self.trend.configure(height=max(140, avail - TREND_CHROME))
-        want_hint = avail >= 560
+        head_h = self.head.winfo_reqheight() if self.head is not None else 100
+        body_h = max(280, avail - head_h - 20)      # body 上下 pady 10 + 10
+        self.pose.configure(height=max(160, body_h - POSE_CHROME))
+        h_trend = 100 if body_h < 480 else (125 if body_h < 600 else 160)
+        self.trend.configure(height=h_trend)
+        want_hint = body_h >= 470
         if want_hint != self._hint_shown:
             if want_hint:
                 self.op_hint.pack(anchor="w", padx=12, pady=(0, 10))
             else:
                 self.op_hint.pack_forget()
             self._hint_shown = want_hint
-        dense = avail < 620
+        dense = body_h < 540
         if dense != self._dense:
             for row in self.row_frames:
                 row.pack_configure(pady=3 if dense else 5)
             self._dense = dense
+        # 矮窗口下让位给操作记录：末端坐标是参考信息，未回零时也读不到
+        show_coord = body_h >= 430
+        if show_coord != self._coord_shown:
+            if show_coord:
+                self.coord_card.grid()
+            else:
+                self.coord_card.grid_remove()
+            self._coord_shown = show_coord
 
     def _on_resize(self, _evt=None):
         """尺寸变化后防抖重绘，保证 0 线始终落在画布中线。"""
@@ -668,6 +755,16 @@ class P340Panel(tk.Frame):
             elif kind == "release":
                 self.motion.reset("演示模式：已模拟松轴")
                 self.on_status("演示模式：已模拟松轴（需重新回零）")
+            elif kind == "lock":
+                if not payload:
+                    self.motion.reset("演示模式：已模拟松轴")
+                self.on_status("演示模式：阻尼锁定{}".format(
+                    "开" if payload else "关（松轴，需重新回零）"))
+            elif kind == "pump":
+                self.on_status("演示模式：吸泵{}".format("开启" if payload else "关闭"))
+            elif kind == "send":
+                axis, target, _delta = payload
+                self.motion.commit(axis, target)
             self._refresh_home_badge()
             return
         if not self.running or self.source is None:
@@ -697,6 +794,146 @@ class P340Panel(tk.Frame):
             self.speed_var.set(self.motion.speed)
             return
         self.on_status("运动速度：{} mm/s".format(self.motion.speed))
+
+    # ---------------------------------------------------------------- 吸泵 / 阻尼锁定
+    def _connected(self):
+        return self.demo or (self.running and self.source is not None)
+
+    def _paint_toggles(self):
+        """两个开关的配色即状态：锁定=深青底，松轴=琥珀底；吸泵开=蓝底。"""
+        if self.lock_on:
+            self.lock_btn.configure(text="阻尼锁定 开", bg="#0F766E", fg="white",
+                                    activebackground="#0D9488", activeforeground="white")
+        else:
+            self.lock_btn.configure(text="阻尼锁定 关", bg="#FEF3C7", fg="#B45309",
+                                    activebackground="#FDE68A", activeforeground="#B45309")
+        if self.pump_on:
+            self.pump_btn.configure(text="吸泵 开", bg="#0284C7", fg="white",
+                                    activebackground="#0EA5E9", activeforeground="white")
+        else:
+            self.pump_btn.configure(text="吸泵 关", bg="#EDF1F6", fg=MUTED,
+                                    activebackground="#E2E8F0", activeforeground=TEXT)
+
+    def _toggle_lock(self):
+        """阻尼锁定开关：开=M18 锁轴保持力矩，关=M17 松轴手推（位置失效）。
+
+        松轴后步进电机没有保持力，J2/J3 会因重力下落，所以必须提示并用
+        「未回零」状态锁死后续运动指令。
+        """
+        if not self._connected():
+            self.on_status("P340 未连接：请先「开始采集」再切换阻尼锁定")
+            return
+        self.lock_on = not self.lock_on
+        self._paint_toggles()
+        self._submit("lock", self.lock_on)
+        self._push_op("lock", on=self.lock_on,
+                      text="阻尼锁定 {}".format("开（M18 锁轴）" if self.lock_on
+                                                else "关（M17 松轴）"))
+        if self.lock_on:
+            self.on_status("阻尼锁定：已锁轴（M18），电机保持力矩；松轴过的话请重新回零")
+        else:
+            self.on_status("阻尼锁定：已松轴（M17），可手推示教；注意臂体下落，继续运动需重新回零")
+
+    def _toggle_pump(self):
+        """吸泵开关：官方 set_gpio_state(0)=开 → M22，set_gpio_state(1)=关 → M23。"""
+        if not self._connected():
+            self.on_status("P340 未连接：请先「开始采集」再操作吸泵")
+            return
+        self.pump_on = not self.pump_on
+        self._paint_toggles()
+        self._submit("pump", self.pump_on)
+        self._push_op("pump", on=self.pump_on,
+                      text="吸泵 {}".format("开" if self.pump_on else "关"))
+        self.on_status("吸泵已{}（{}）".format(
+            "开启" if self.pump_on else "关闭",
+            "M22 导通，确认吸盘已贴合再移动" if self.pump_on else "M23 断开，工件释放"))
+
+    # ---------------------------------------------------------------- 操作记录
+    def _push_op(self, kind, text, **kw):
+        rec = dict(kind=kind, text=text, t=time.strftime("%H:%M:%S"))
+        rec.update(kw)
+        self.ops.append(rec)
+        if len(self.ops) > 200:
+            self.ops.pop(0)
+        self.redo_ops.clear()
+        self._refresh_ops()
+
+    def _refresh_ops(self):
+        if self.op_list is None:
+            return
+        self.op_list.delete(0, tk.END)
+        for i, rec in enumerate(self.ops, 1):
+            self.op_list.insert(tk.END, "{:>3}  {}  {}".format(i, rec["t"], rec["text"]))
+        if self.ops:
+            self.op_list.see(tk.END)
+        self.op_count_label.configure(text="{} 条".format(len(self.ops)))
+        self.undo_btn.configure(state="normal" if self.ops else "disabled")
+        self.redo_btn.configure(state="normal" if self.redo_ops else "disabled")
+
+    def _apply_op(self, rec, reverse=False):
+        """按记录重放一条；reverse=True 为撤销。返回 (是否成功, 提示)。"""
+        if not self._connected():
+            return False, "P340 未连接，无法回放"
+        kind = rec["kind"]
+        if kind == "joint":
+            axis = rec["axis"]
+            delta = -rec["delta"] if reverse else rec["delta"]
+            try:
+                tgt, d = self.motion.plan(axis, self.motion.joints[axis] + delta)
+            except MotionRejected as exc:
+                return False, str(exc)
+            self._submit("send", (axis, tgt, d))
+            return True, "J{} {} {:+.2f}°（目标 {:+.2f}°）".format(
+                axis + 1, "撤销" if reverse else "重做", d, tgt)
+        if kind == "pump":
+            want = (not rec["on"]) if reverse else rec["on"]
+            self.pump_on = want
+            self._paint_toggles()
+            self._submit("pump", want)
+            return True, "吸泵{}".format("开" if want else "关")
+        if kind == "lock":
+            want = (not rec["on"]) if reverse else rec["on"]
+            self.lock_on = want
+            self._paint_toggles()
+            self._submit("lock", want)
+            return True, "阻尼锁定{}".format("开" if want else "关")
+        return False, "未知记录类型 {}".format(kind)
+
+    def _rollback(self):
+        if not self.ops:
+            self.on_status("没有可撤销的操作")
+            return
+        rec = self.ops[-1]
+        ok, msg = self._apply_op(rec, reverse=True)
+        if not ok:
+            self.on_status("撤销失败：" + msg)
+            return
+        self.ops.pop()
+        self.redo_ops.append(rec)
+        self._refresh_ops()
+        self.on_status("已撤销：" + msg)
+
+    def _redo(self):
+        if not self.redo_ops:
+            self.on_status("没有可重做的操作")
+            return
+        rec = self.redo_ops[-1]
+        ok, msg = self._apply_op(rec, reverse=False)
+        if not ok:
+            self.on_status("重做失败：" + msg)
+            return
+        self.redo_ops.pop()
+        self.ops.append(rec)
+        self._refresh_ops()
+        self.on_status("已重做：" + msg)
+
+    def _clear_ops(self):
+        if not self.ops and not self.redo_ops:
+            return
+        self.ops.clear()
+        self.redo_ops.clear()
+        self._refresh_ops()
+        self.on_status("操作记录已清空")
 
     def _refresh_home_badge(self):
         """回零状态徽标：未回零 / 回零中 / 已回零。"""
@@ -795,6 +1032,8 @@ class P340Panel(tk.Frame):
         self._paint_row(idx, tgt)
         self._draw_pose(self.last_angles)
         self._submit("send", (idx, tgt, delta))
+        self._push_op("joint", axis=idx, delta=delta, target=tgt,
+                      text="J{} 相对 {:+.2f}° → {:+.2f}°".format(idx + 1, delta, tgt))
         self.on_status("P340 下发 J{} {} {:+.2f}°（目标 {:+.2f}°）".format(
             idx + 1,
             "相对" if self.motion.mode == motion_mod.MODE_REL else "绝对",
@@ -834,7 +1073,11 @@ class P340Panel(tk.Frame):
         self.frames = 0
         self._bar_dragging = -1
         self.source = None
-        # 每次建立连接都回到未回零状态：步进电机掉电后位置未知，必须重新 G28
+        # 每次建立连接都回到未回零状态：步进电机掉电后位置未知，必须重新 G28；
+        # 吸泵与锁轴按固件默认值复位（掉电即关泵、上电即锁轴）
+        self.pump_on = False
+        self.lock_on = True
+        self._paint_toggles()
         if demo:
             self.motion.mark_homed()
         else:
@@ -954,8 +1197,10 @@ class P340Panel(tk.Frame):
         else:
             tail = "{} 模式 · 角度=软件模型".format(
                 motion_mod.MODE_LABELS[self.motion.mode])
-        self.on_status("P340 | {} | {} | 帧 {} | 读取 {:.1f} ms{}{}".format(
-            mode, tail, self.frames, elapsed_ms,
+        self.on_status("P340 | {} | {} | 吸泵{}·{} | 帧 {} | 读取 {:.1f} ms{}{}".format(
+            mode, tail, "开" if self.pump_on else "关",
+            "锁定" if self.lock_on else "松轴",
+            self.frames, elapsed_ms,
             " | 演示 J{}".format(active + 1) if active >= 0 else "", warn))
 
     # ---------------------------------------------------------------- 绘图
@@ -1347,6 +1592,48 @@ def panel_selftest():
         assert ("set_angle", 1, 20.0, panel.motion.speed) in src.robot.calls, \
             "下行指令不是相对增量: {}".format(src.robot.calls)
         assert any("回零完成" in m for m in msgs), "回零完成未回报状态"
+
+        # 7) 真机外设：吸泵 M22/M23、锁轴 M18/M17 必须落到串口
+        src._exec("pump", True)
+        src._exec("pump", False)
+        src._exec("lock", False)
+        assert panel.motion.homed is False, "松轴后应回到未回零"
+        src._exec("lock", True)
+        writes = [w.strip() for w in src.robot._serial_port.writes]
+        for cmd in ("M22", "M23", "M17", "M18"):
+            assert cmd in writes, "{} 未下发: {}".format(cmd, writes)
+        assert any("吸泵已开启" in m for m in msgs), "吸泵状态未回报"
+        assert any("已松轴" in m for m in msgs), "松轴提示未回报"
+
+        # 8) 操作记录：开关留痕、撤销回到前一状态、重做再切回去
+        panel.demo, panel.running = True, True
+        panel.source = None
+        panel.ops.clear()
+        panel.redo_ops.clear()
+        panel.pump_on, panel.lock_on = False, True
+        panel._paint_toggles()
+        panel._toggle_pump()
+        panel._toggle_lock()
+        assert [r["kind"] for r in panel.ops] == ["pump", "lock"], \
+            "操作记录未按顺序留痕: {}".format(panel.ops)
+        assert panel.pump_on is True and panel.lock_on is False
+        panel._rollback()
+        assert len(panel.ops) == 1 and len(panel.redo_ops) == 1, "撤销未移动记录"
+        assert panel.lock_on is True, "撤销锁定开关未回滚状态"
+        panel._redo()
+        assert len(panel.ops) == 2 and not panel.redo_ops, "重做未恢复记录"
+        assert panel.lock_on is False, "重做未重新执行锁定"
+        assert panel.op_list.size() == 2, "列表控件未同步"
+
+        # 9) 关节记录的撤销方向必须相反
+        panel.motion.mark_homed()
+        panel.lock_on = True
+        panel.ops.clear(); panel.redo_ops.clear()
+        panel._push_op("joint", axis=0, delta=12.0, target=12.0, text="J1 +12")
+        panel.motion.commit(0, 12.0)
+        panel._rollback()
+        assert panel.motion.joints[0] == 0.0, "关节撤销未反向回零位: {}".format(
+            panel.motion.joints)
     finally:
         root.destroy()
     return True
