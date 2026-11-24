@@ -26,6 +26,8 @@ import tkinter as tk
 from tkinter import ttk
 
 import robot_profiles as profiles
+import p340_motion as motion_mod
+from p340_motion import MotionRejected
 
 # 与主界面一致的浅色主题；独立定义，避免反向 import joint_monitor
 BG = "#F4F6F9"
@@ -45,6 +47,8 @@ FONT_TINY = ("Microsoft YaHei UI", 8)
 HISTORY = 120
 L1, L2 = 110.0, 95.0        # 平面姿态示意连杆长度（可视化，非真实 mm）
 BASE_H = 26.0
+POSE_CHROME = 210           # 中间卡除画布外的固定高度（标题+模式行+脚注+边距）
+TREND_CHROME = 232          # 右侧趋势卡除画布外的固定高度
 
 # 与主界面「动作」下拉一致，四个预设全部提供 P340 四轴版
 DEMO_PRESETS = ("自由摆动", "逐关节演示", "抓取循环", "归零静止")
@@ -238,26 +242,146 @@ def pose3d_selftest():
 
 
 class _P340Source:
-    """P340 真机 / 演示数据源。真机走官方 G-code 文本协议读数接口。"""
+    """P340 真机 / 演示数据源。
 
-    def __init__(self, profile, port, baud, demo, axis_mode_getter, preset_getter=None):
+    真机侧遵守步进电机的三条硬约束（见 p340_motion 模块说明）：
+      * 回零前不读关节角——读出来也不可信，角度改由 P340Motion 软件模型提供；
+      * 所有运动指令走命令队列，在本采集线程里串行执行，避免多线程抢串口；
+      * 回零用自带超时的 g28()，不用驱动里会死等的 go_zero()。
+    """
+
+    def __init__(self, profile, port, baud, demo, axis_mode_getter,
+                 preset_getter=None, motion=None):
         self.profile = profile
         self.port = port
         self.baud = baud
         self.demo = demo
         self.axis_mode_getter = axis_mode_getter
         self.preset_getter = preset_getter or (lambda: DEMO_PRESETS[0])
+        self.motion = motion or motion_mod.P340Motion(
+            axes=profile.dof, limits_3=profile.joint_limits,
+            limits_4=profile.joint_limits_alt)
         self.robot = None
+        self.cmds = queue.Queue()
+        self.report = lambda _text: None      # 由面板注入，回传状态到 UI 线程
         self._n = 0
         self._coords = None
 
+    # ---- 生命周期
     def open(self):
         if self.demo:
             return
         if not self.port:
             raise ValueError("未选择串口，请先点击「刷新」扫描端口")
         self.robot = profiles.create_robot(self.profile, self.port, self.baud)
+        try:
+            self.robot.set_speed_mode(0)      # 匀速模式，拖动单步指令更可预期
+        except Exception:
+            pass
+        self.motion.reset("已连接，等待回零")
 
+    def close(self):
+        try:
+            if self.robot is not None:
+                self.robot._serial_port.close()
+        except Exception:
+            pass
+        self.robot = None
+
+    # ---- 指令队列（UI 线程只入队，串口操作全部落在这里）
+    def submit(self, kind, payload=None):
+        self.cmds.put((kind, payload))
+
+    def _drain(self):
+        while True:
+            try:
+                kind, payload = self.cmds.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                self._exec(kind, payload)
+            except Exception as exc:
+                self.report("指令 {} 异常：{}: {}".format(
+                    kind, type(exc).__name__, exc))
+
+    def _exec(self, kind, payload):
+        if self.demo:
+            self._exec_demo(kind, payload)
+            return
+        if self.robot is None:
+            self.report("串口未连接，指令已丢弃")
+            return
+        if kind == "home":
+            self._do_home()
+        elif kind == "send":
+            self._do_send(*payload)
+        elif kind == "mode":
+            self._do_mode(payload)
+        elif kind == "release":
+            self.robot.release_all_servos()
+            self.motion.reset("已松轴：位置未知，需重新回零")
+            self.report("全部关节已掉电（可手动示教）；继续运动前必须重新回零")
+        elif kind == "power":
+            self.robot.power_on()
+            self.report("全部关节已上电")
+
+    def _exec_demo(self, kind, payload):
+        """演示模式下这些指令只做本地状态迁移，不涉及硬件。"""
+        if kind == "home":
+            self.motion.mark_homed()
+            self.report("演示模式：已模拟回零，角度归零")
+        elif kind == "release":
+            self.motion.reset("演示模式：已模拟松轴")
+            self.report("演示模式：已模拟松轴（需重新回零）")
+
+    def _do_home(self):
+        self.report("回零中（G28），约 10-20 秒，请勿触碰机械臂…")
+        ok = motion_mod.g28(self.robot, motion_mod.HOME_TIMEOUT)
+        if not ok:
+            self.motion.reset("回零失败")
+            self.report("回零失败：未收到 ok 应答（检查 12V 供电 / 串口 / 限位开关）")
+            return
+        try:
+            self.robot.set_mode(1 if self.motion.mode == motion_mod.MODE_REL else 0)
+        except Exception:
+            pass
+        sw = motion_mod.switch_state(self.robot)
+        self.motion.mark_homed()
+        self.report("回零完成，已切{}模式{}".format(
+            motion_mod.MODE_LABELS[self.motion.mode],
+            "；限位开关 {}".format(sw) if sw else ""))
+
+    def _do_mode(self, mode):
+        self.motion.set_mode(mode)
+        try:
+            self.robot.set_mode(1 if mode == motion_mod.MODE_REL else 0)
+        except Exception as exc:
+            self.report("切换运动模式失败：{}".format(exc))
+            return
+        self.report("运动模式：{}".format(motion_mod.MODE_LABELS[mode]))
+
+    def _do_send(self, axis, target, delta):
+        if not self.motion.homed:
+            self.report("未回零：指令已拦截（先点「回零 G28」）")
+            return
+        speed = int(self.motion.speed)
+        try:
+            if self.motion.mode == motion_mod.MODE_REL:
+                self.robot.set_mode(1)                     # 每条指令前重申模态
+                self.robot.set_angle(axis + 1, round(delta, 2), speed)
+            else:
+                self.robot.set_mode(0)
+                self.robot.set_angle(axis + 1, round(target, 2), speed)
+        except Exception as exc:
+            self.report("J{} 下发失败：{}: {}".format(axis + 1, type(exc).__name__, exc))
+            return
+        self.motion.commit(axis, target)
+        self.report("J{} {} {:+.2f}° → 目标 {:+.2f}°".format(
+            axis + 1, "相对" if self.motion.mode == motion_mod.MODE_REL else "绝对",
+            delta if self.motion.mode == motion_mod.MODE_REL else target,
+            self.motion.joints[axis]))
+
+    # ---- 采样
     def read(self):
         t0 = time.perf_counter()
         n = self.axis_mode_getter()
@@ -267,23 +391,15 @@ class _P340Source:
             return angles, None, ms, active
 
         self._n += 1
-        angles = profiles.read_angles(self.robot, self.profile)
-        if self._n % 5 == 1:
-            coords = profiles.read_coords(self.robot, self.profile)
+        self._drain()
+        # 关节角不读串口，直接取软件模型；坐标仅在回零后低频读取（带超时）
+        if self.motion.homed and self._n % 5 == 1:
+            coords = motion_mod.read_coords(self.robot, timeout=0.6)
             if coords:
                 self._coords = coords
         ms = (time.perf_counter() - t0) * 1000.0
-        if not angles or len(angles) < n:      # 无响应时保留上一帧
-            return None, self._coords, ms, -1
-        return [float(x) for x in angles[:n]], self._coords, ms, -1
+        return self.motion.snapshot(n), self._coords, ms, -1
 
-    def close(self):
-        try:
-            if self.robot is not None:
-                self.robot._serial_port.close()
-        except Exception:
-            pass
-        self.robot = None
 
 
 class P340Panel(tk.Frame):
@@ -296,6 +412,18 @@ class P340Panel(tk.Frame):
         self.axis_var = tk.IntVar(value=self.profile.dof)   # 3 / 4 轴
         self._axis_n = self.profile.dof                    # 采集线程读取，避免跨线程访问 tk 变量
         self._preset = DEMO_PRESETS[0]                     # 采集线程读取当前演示预设
+        # 运动门禁：步进电机必须回零后才能下发，角度来自软件模型而非串口读回
+        self.motion = motion_mod.P340Motion(
+            axes=self.profile.dof, limits_3=self.profile.joint_limits,
+            limits_4=self.profile.joint_limits_alt)
+        self.source = None                # 采集线程内的数据源，用于入队指令
+        self.mode_var = tk.StringVar(value=motion_mod.MODE_REL)
+        self.speed_var = tk.IntVar(value=motion_mod.DEFAULT_SPEED)
+        # 角度条拖动状态
+        self._bar_dragging = -1
+        self._bar_edit = [0.0] * self.profile.max_joints
+        self._hint_shown = True          # 矮窗口下隐藏底部操作提示，避免被裁切
+        self._dense = False              # 矮窗口下压缩关节行间距
         self._resize_job = None
         self.pose_mode = tk.StringVar(value="3d")          # 3D 姿态 / 2D 侧视
         self.view_az = math.radians(-35.0)
@@ -325,18 +453,50 @@ class P340Panel(tk.Frame):
     def _build(self):
         head = tk.Frame(self, bg=CARD, highlightthickness=1, highlightbackground=GRID)
         head.pack(fill="x", padx=10, pady=(10, 6))
-        tk.Label(head, text="ultraArm P340 · 四轴码垛步进机械臂监控", bg=CARD, fg=TEXT,
-                 font=FONT_UI_B).pack(side="left", padx=10, pady=8)
-        self.spec_label = tk.Label(head, text=profiles.summary(self.profile), bg=CARD,
+        top = tk.Frame(head, bg=CARD)
+        top.pack(fill="x")
+        tk.Label(top, text="ultraArm P340 · 四轴码垛步进机械臂监控", bg=CARD, fg=TEXT,
+                 font=FONT_UI_B).pack(side="left", padx=10, pady=(8, 2))
+        self.spec_label = tk.Label(top, text=profiles.summary(self.profile), bg=CARD,
                                    fg=MUTED, font=FONT_SMALL)
-        self.spec_label.pack(side="left", padx=4)
-        tk.Label(head, text="自由度", bg=CARD, fg=MUTED, font=FONT_SMALL).pack(
-            side="left", padx=(12, 2))
+        self.spec_label.pack(side="left", padx=4, pady=(8, 2))
+        self.home_badge = tk.Label(top, text="● 未回零", bg="#FEF2F2", fg="#B91C1C",
+                                   font=FONT_UI_B, padx=8, pady=2)
+        self.home_badge.pack(side="right", padx=10, pady=(8, 2))
+
+        # 第二行：回零门禁 + 运动参数。步进电机必须先 G28 才能发运动指令
+        ctl = tk.Frame(head, bg=CARD)
+        ctl.pack(fill="x", padx=10, pady=(0, 8))
+        tk.Label(ctl, text="自由度", bg=CARD, fg=MUTED, font=FONT_SMALL).pack(
+            side="left", padx=(0, 2))
         for n in self.profile.dof_options:
-            tk.Radiobutton(head, text="{} 轴".format(n), value=n, variable=self.axis_var,
+            tk.Radiobutton(ctl, text="{} 轴".format(n), value=n, variable=self.axis_var,
                            indicatoron=False, bg="#EDF1F6", selectcolor="#DBEAFE",
-                           fg=TEXT, font=FONT_SMALL, relief="flat", padx=8, pady=2,
-                           command=self.set_axis_mode).pack(side="left", padx=2, pady=8)
+                           fg=TEXT, font=FONT_SMALL, relief="flat", padx=8, pady=1,
+                           command=self.set_axis_mode).pack(side="left", padx=2)
+        self.home_btn = tk.Button(ctl, text="回零 G28", command=self._request_home,
+                                  font=FONT_UI_B, bg="#2563EB", fg="white",
+                                  relief="flat", padx=10, pady=1)
+        self.home_btn.pack(side="left", padx=(12, 2))
+        tk.Button(ctl, text="松轴示教", command=lambda: self._submit("release"),
+                  font=FONT_SMALL, bg="#EDF1F6", fg=TEXT, relief="flat",
+                  padx=8, pady=1).pack(side="left", padx=2)
+        tk.Button(ctl, text="上电", command=lambda: self._submit("power"),
+                  font=FONT_SMALL, bg="#EDF1F6", fg=TEXT, relief="flat",
+                  padx=8, pady=1).pack(side="left", padx=2)
+        tk.Label(ctl, text="运动", bg=CARD, fg=MUTED, font=FONT_SMALL).pack(
+            side="left", padx=(12, 2))
+        for label, val in ((motion_mod.MODE_LABELS[motion_mod.MODE_REL], motion_mod.MODE_REL),
+                           (motion_mod.MODE_LABELS[motion_mod.MODE_ABS], motion_mod.MODE_ABS)):
+            tk.Radiobutton(ctl, text=label, value=val, variable=self.mode_var,
+                           indicatoron=False, bg="#EDF1F6", selectcolor="#DBEAFE",
+                           fg=TEXT, font=FONT_SMALL, relief="flat", padx=6, pady=1,
+                           command=self._on_mode_change).pack(side="left", padx=2)
+        tk.Label(ctl, text="速度", bg=CARD, fg=MUTED, font=FONT_SMALL).pack(
+            side="left", padx=(10, 2))
+        tk.Spinbox(ctl, from_=10, to=200, increment=10, width=4, font=FONT_SMALL,
+                   textvariable=self.speed_var, relief="flat", bg="#F3F5F8",
+                   command=self._on_speed_change).pack(side="left")
 
         body = tk.Frame(self, bg=BG)
         body.pack(fill="both", expand=True, padx=10, pady=(0, 10))
@@ -372,10 +532,20 @@ class P340Panel(tk.Frame):
             self.value_labels.append(v)
             c = tk.Canvas(row, width=210, height=18, bg=TRACK, highlightthickness=0)
             c.pack(fill="x", pady=(4, 0))
+            # 拖动角度条：按下/拖动只做预览，松开才下发一条相对增量指令
+            c.bind("<ButtonPress-1>", lambda e, idx=i: self._bar_press(e, idx))
+            c.bind("<B1-Motion>", lambda e, idx=i: self._bar_drag(e, idx))
+            c.bind("<ButtonRelease-1>", lambda e, idx=i: self._bar_release(e, idx))
+            c.configure(cursor="sb_h_double_arrow")
             self.bar_canvases.append(c)
-        tk.Label(left, text="供电 12V 5A · 串口 115200\n读数 get_angles_info() / get_coords_info()",
+        tk.Label(left, text="12V 5A · 115200 波特率 · 步进电机\n"
+                            "回零后角度为软件模型值（不读串口）",
                  bg=CARD, fg=MUTED, font=FONT_SMALL, justify="left").pack(
-            anchor="w", padx=12, pady=(14, 10))
+            anchor="w", padx=12, pady=(10, 4))
+        self.op_hint = tk.Label(left, text="拖动角度条 → 松手下发相对增量（≤±45°/次）",
+                                bg=CARD, fg=MUTED, font=FONT_TINY, justify="left",
+                                wraplength=230)
+        self.op_hint.pack(anchor="w", padx=12, pady=(0, 10))
 
         # 中：3D 姿态（可切 2D 侧视）
         mid = tk.Frame(body, bg=CARD, highlightthickness=1, highlightbackground=GRID)
@@ -434,6 +604,29 @@ class P340Panel(tk.Frame):
             self.coord_labels.append(lab)
         self.bind("<Configure>", self._on_resize)
 
+    def fit_height(self, avail):
+        """按宿主可用高度重排两个画布。
+
+        P340 面板是画布宿主里的 window item，若只靠自然高度，画布会按内容请求
+        尺寸不断长大、把纵向滚动条顶出来（1226 级“棘轮”）。这里显式给定高度：
+        中间 3D 卡与右侧趋势卡各自铺满，卡片其余部分的高度由 chrome 常量扣除。
+        """
+        avail = max(360, int(avail))
+        self.pose.configure(height=max(200, avail - POSE_CHROME))
+        self.trend.configure(height=max(140, avail - TREND_CHROME))
+        want_hint = avail >= 560
+        if want_hint != self._hint_shown:
+            if want_hint:
+                self.op_hint.pack(anchor="w", padx=12, pady=(0, 10))
+            else:
+                self.op_hint.pack_forget()
+            self._hint_shown = want_hint
+        dense = avail < 620
+        if dense != self._dense:
+            for row in self.row_frames:
+                row.pack_configure(pady=3 if dense else 5)
+            self._dense = dense
+
     def _on_resize(self, _evt=None):
         """尺寸变化后防抖重绘，保证 0 线始终落在画布中线。"""
         if self._resize_job is not None:
@@ -464,9 +657,153 @@ class P340Panel(tk.Frame):
         self._preset = preset
         self.on_status("P340 演示动作切换为：" + preset)
 
+    # ---------------------------------------------------------------- 指令下发
+    def _submit(self, kind, payload=None):
+        """把指令塞进采集线程的队列；串口只由那一个线程操作。"""
+        if self.demo:
+            # 演示模式无需串口，直接在本线程模拟状态迁移
+            if kind == "home":
+                self.motion.mark_homed()
+                self.on_status("演示模式：已模拟回零，角度归零")
+            elif kind == "release":
+                self.motion.reset("演示模式：已模拟松轴")
+                self.on_status("演示模式：已模拟松轴（需重新回零）")
+            self._refresh_home_badge()
+            return
+        if not self.running or self.source is None:
+            self.on_status("P340 未连接：请先在主工具栏点「开始采集」建立串口")
+            return
+        self.source.submit(kind, payload)
+
+    def _request_home(self):
+        """回零入口。步进电机每次上电都必须先 G28，运动指令才被放行。"""
+        if self.running and not self.demo:
+            self.home_btn.config(state="disabled", text="回零中…")
+            self.on_status("P340 发送 G28 回零，请等待约 10-20 秒…")
+        self._submit("home")
+
+    def _on_mode_change(self):
+        mode = self.mode_var.get()
+        self.motion.set_mode(mode)
+        if self.demo or not self.running:
+            self.on_status("运动模式：{}".format(motion_mod.MODE_LABELS[mode]))
+            return
+        self._submit("mode", mode)
+
+    def _on_speed_change(self):
+        try:
+            self.motion.speed = max(10, min(200, int(self.speed_var.get())))
+        except (tk.TclError, ValueError):
+            self.speed_var.set(self.motion.speed)
+            return
+        self.on_status("运动速度：{} mm/s".format(self.motion.speed))
+
+    def _refresh_home_badge(self):
+        """回零状态徽标：未回零 / 回零中 / 已回零。"""
+        if self.demo:
+            self.home_badge.config(text="● 演示·已模拟回零", bg="#EFF6FF", fg="#1D4ED8")
+            self.home_btn.config(state="normal", text="模拟回零")
+            return
+        if self.motion.homed:
+            self.home_badge.config(text="● 已回零", bg="#ECFDF5", fg="#047857")
+            self.home_btn.config(state="normal", text="重新回零 G28")
+            return
+        if self.running and str(self.home_btn["state"]) == "disabled":
+            self.home_badge.config(text="● 回零中", bg="#FEF9C3", fg="#A16207")
+            return
+        self.home_badge.config(text="● 未回零", bg="#FEF2F2", fg="#B91C1C")
+        if str(self.home_btn["state"]) == "disabled":
+            self.home_btn.config(state="normal", text="回零 G28")
+
+    # ---------------------------------------------------------------- 角度条拖动
+    def _can_drag(self):
+        """演示模式随时可拖；真机必须先回零，否则角度不可信、指令也会被拦截。"""
+        if self.demo:
+            return True
+        return bool(self.running and self.motion.homed)
+
+    def _x_to_angle(self, i, x):
+        """角度条 x 坐标 → 角度，与 _draw_bar 的 0 线居中映射互逆。"""
+        c = self.bar_canvases[i]
+        w = c.winfo_width()
+        if w < 20:                       # 未完成布局时退回请求宽度，与 _draw_bar 一致
+            w = c.winfo_reqwidth()
+        w = max(120, w)
+        pad = 3
+        mid = w / 2.0
+        left_w = max(1.0, mid - pad)
+        right_w = max(1.0, w - pad - mid)
+        lo, hi = self._limit_at(i)
+        neg_span = max(1e-6, -lo) if lo < 0 else 1e-6
+        pos_span = max(1e-6, hi) if hi > 0 else 1e-6
+        if x >= mid:
+            val = (x - mid) / right_w * pos_span
+        else:
+            val = -(mid - x) / left_w * neg_span
+        return max(float(lo), min(float(hi), val))
+
+    def _paint_row(self, i, val):
+        lo, hi = self._limit_at(i)
+        self._draw_bar(self.bar_canvases[i], val, lo, hi, JOINT_COLORS[i])
+        self.value_labels[i].configure(
+            text="{:+.2f}".format(val) if val is not None else "--.--")
+
+    def _bar_press(self, evt, idx):
+        if not self._can_drag():
+            self.on_status("P340 未回零：先点「回零 G28」再拖动角度条")
+            return
+        self._bar_dragging = idx
+        self._bar_edit[idx] = self._x_to_angle(idx, evt.x)
+        self._paint_row(idx, self._bar_edit[idx])
+        self.last_angles[idx] = self._bar_edit[idx]
+        self._draw_pose(self.last_angles)
+
+    def _bar_drag(self, evt, idx):
+        if self._bar_dragging != idx:
+            return
+        self._bar_edit[idx] = self._x_to_angle(idx, evt.x)
+        self._paint_row(idx, self._bar_edit[idx])
+        self.last_angles[idx] = self._bar_edit[idx]
+        self._draw_pose(self.last_angles)
+
+    def _bar_release(self, evt, idx):
+        if self._bar_dragging != idx:
+            return
+        self._bar_dragging = -1
+        target = self._x_to_angle(idx, evt.x)
+        self._bar_edit[idx] = target
+
+        if self.demo:
+            self.last_angles[idx] = target
+            self._paint_row(idx, target)
+            self._draw_pose(self.last_angles)
+            self.on_status("P340 演示：J{} 预览 {:+.2f}°（未下发）".format(idx + 1, target))
+            return
+
+        try:
+            tgt, delta = self.motion.plan(idx, target)
+        except MotionRejected as exc:
+            base = self.motion.joints[idx]
+            self.last_angles[idx] = base
+            self._paint_row(idx, base)
+            self._draw_pose(self.last_angles)
+            self.on_status("P340 指令未下发：{}".format(exc))
+            return
+
+        # 乐观显示：先按目标角画，真正结果由采集线程回报
+        self.last_angles[idx] = tgt
+        self._paint_row(idx, tgt)
+        self._draw_pose(self.last_angles)
+        self._submit("send", (idx, tgt, delta))
+        self.on_status("P340 下发 J{} {} {:+.2f}°（目标 {:+.2f}°）".format(
+            idx + 1,
+            "相对" if self.motion.mode == motion_mod.MODE_REL else "绝对",
+            delta if self.motion.mode == motion_mod.MODE_REL else tgt, tgt))
+
     def set_axis_mode(self):
         """3 轴 / 4 轴切换：官方标注自由度 3-4，第 4 轴为选配。"""
         self._axis_n = self.axis_var.get()
+        self.motion.set_axes(self._axis_n)
         self.history = []
         for i in range(self.profile.max_joints):
             show = i < self.axis_var.get()
@@ -495,16 +832,28 @@ class P340Panel(tk.Frame):
         self.interval = max(0.05, interval_ms / 1000.0)
         self.history = []
         self.frames = 0
+        self._bar_dragging = -1
+        self.source = None
+        # 每次建立连接都回到未回零状态：步进电机掉电后位置未知，必须重新 G28
+        if demo:
+            self.motion.mark_homed()
+        else:
+            self.motion.reset("等待回零")
+        self._refresh_home_badge()
         self.stop_evt = threading.Event()
         self.running = True
         self.thread = threading.Thread(target=self._reader, daemon=True)
         self.thread.start()
-        self.on_status("P340 {}· {} 采集中...".format(
-            "演示模式" if demo else "真机", self._preset))
+        self.on_status("P340 {}· {} 采集中...{}".format(
+            "演示模式" if demo else "真机", self._preset,
+            "" if demo else "（请先回零 G28）"))
 
     def _reader(self):
         src = _P340Source(self.profile, self.port, self.baud, self.demo,
-                          lambda: self._axis_n, lambda: self._preset)
+                          lambda: self._axis_n, lambda: self._preset,
+                          motion=self.motion)
+        src.report = lambda text: self.q.put(("status", text))
+        self.source = src
         try:
             src.open()
             self.q.put(("ready", None))
@@ -515,11 +864,15 @@ class P340Panel(tk.Frame):
             self.q.put(("error", "{}: {}".format(type(exc).__name__, exc)))
         finally:
             src.close()
+            self.source = None
             self.q.put(("closed", None))
 
     def stop(self):
         self.stop_evt.set()
         self.running = False
+        self._bar_dragging = -1
+        self.motion.reset("采集已停止")
+        self._refresh_home_badge()
         self.on_status("P340 已停止采集")
 
     def close(self):
@@ -539,10 +892,19 @@ class P340Panel(tk.Frame):
                 if kind == "error":
                     self.on_status("P340 错误: " + str(payload))
                     self.running = False
+                    self.motion.reset("连接异常")
+                    self._refresh_home_badge()
+                elif kind == "status":
+                    self.on_status(str(payload))
+                    self._refresh_home_badge()
+                elif kind == "ready":
+                    self._refresh_home_badge()
                 elif kind == "data":
                     self._update(*payload)
                 elif kind == "closed":
                     self.running = False
+                    self.motion.reset("连接已断开")
+                    self._refresh_home_badge()
         except queue.Empty:
             pass
         except tk.TclError:
@@ -557,11 +919,16 @@ class P340Panel(tk.Frame):
             return
         n = self.axis_var.get()
         vals = list(angles[:n])
-        self.history.append(vals)
-        if len(self.history) > HISTORY:
-            self.history.pop(0)
+        # 真机未回零时关节角没有参考基准，全部显示 "--" 而不是假的 0.00
+        live = self.demo or self.motion.homed
+        if live:
+            self.history.append(vals)
+            if len(self.history) > HISTORY:
+                self.history.pop(0)
         for i in range(self.profile.max_joints):
-            v = vals[i] if i < len(vals) else None
+            if i == self._bar_dragging:
+                continue                     # 拖动预览优先，不被采样帧覆盖
+            v = vals[i] if (i < len(vals) and live) else None
             self.last_angles[i] = 0.0 if v is None else v
             self.value_labels[i].configure(
                 text="{:+.2f}".format(v) if v is not None else "--.--",
@@ -580,8 +947,15 @@ class P340Panel(tk.Frame):
         over = profiles.over_limit(self.profile, vals, limits)
         warn = " | 超限位 J{}".format(",".join(str(j) for j in over)) if over else ""
         mode = "演示" if self.demo else "真机 " + (self.port or "-")
+        if self.demo:
+            tail = self._preset
+        elif not self.motion.homed:
+            tail = "未回零 · 角度不可用（点「回零 G28」）"
+        else:
+            tail = "{} 模式 · 角度=软件模型".format(
+                motion_mod.MODE_LABELS[self.motion.mode])
         self.on_status("P340 | {} | {} | 帧 {} | 读取 {:.1f} ms{}{}".format(
-            mode, self._preset if self.demo else "真机数据", self.frames, elapsed_ms,
+            mode, tail, self.frames, elapsed_ms,
             " | 演示 J{}".format(active + 1) if active >= 0 else "", warn))
 
     # ---------------------------------------------------------------- 绘图
@@ -870,4 +1244,113 @@ class P340Panel(tk.Frame):
         self._draw_pose(self.last_angles)
 
 
-__all__ = ["P340Panel", "DEMO_PRESETS", "demo_angles", "pose3d_selftest"]
+class _FakeSource:
+    """UI 自检用的假数据源，只记录入队指令。"""
+
+    def __init__(self):
+        self.cmds = []
+
+    def submit(self, kind, payload=None):
+        self.cmds.append((kind, payload))
+
+
+class _Evt:
+    def __init__(self, x, y=9):
+        self.x = x
+        self.y = y
+
+
+def panel_selftest():
+    """创建真实 Tk 窗口，验证回零门禁与拖动发指令的完整链路（自动化）。"""
+    root = tk.Tk()
+    root.withdraw()
+    panel = P340Panel(root)
+    panel.pack(fill="both", expand=True)
+    root.update()
+    try:
+        canvas = panel.bar_canvases[0]
+        w = canvas.winfo_width()
+        if w < 20:
+            w = canvas.winfo_reqwidth()
+
+        # 1) 演示模式：拖动只改预览，不入队
+        panel.demo, panel.running = True, True
+        panel.motion.mark_homed()
+        panel._refresh_home_badge()
+        before = panel.last_angles[0]
+        panel._bar_press(_Evt(w * 0.85), 0)
+        panel._bar_drag(_Evt(w * 0.90), 0)
+        panel._bar_release(_Evt(w * 0.90), 0)
+        assert panel.last_angles[0] != before, "演示拖动未更新预览"
+        assert panel.source is None, "演示模式不应产生串口数据源"
+
+        # 2) 真机未回零：拖动被拦截，角度保持不变
+        panel.demo = False
+        panel.motion.reset("自检：未回零")
+        panel._refresh_home_badge()
+        panel.source = _FakeSource()
+        keep = panel.last_angles[0]
+        panel._bar_press(_Evt(w * 0.10), 0)
+        panel._bar_release(_Evt(w * 0.10), 0)
+        assert panel.last_angles[0] == keep, "未回零仍然改动了角度"
+        assert panel.source.cmds == [], "未回零仍然下发了指令"
+        assert "未回零" in panel.home_badge["text"]
+
+        # 3) 回零按钮入队
+        panel._request_home()
+        assert panel.source.cmds and panel.source.cmds[0][0] == "home", "回零未入队"
+
+        # 4) 回零后拖动：下发一条相对增量，且不超过 MAX_STEP_DEG
+        panel.motion.mark_homed()
+        panel._refresh_home_badge()
+        assert "已回零" in panel.home_badge["text"]
+        panel.source.cmds.clear()
+        panel._bar_press(_Evt(w * 0.95), 0)
+        panel._bar_release(_Evt(w * 0.95), 0)
+        kinds = [c[0] for c in panel.source.cmds]
+        assert kinds == ["send"], "回零后拖动未下发指令: {}".format(kinds)
+        _kind, (axis, tgt, delta) = panel.source.cmds[0]
+        assert axis == 0 and 0 < delta <= motion_mod.MAX_STEP_DEG + 1e-6, \
+            "增量越界: axis={} tgt={} delta={}".format(axis, tgt, delta)
+        assert panel.motion.joints[0] == 0.0, "指令尚未执行，模型不应提前变化"
+
+        # 5) 4 轴模式下行号校验
+        panel.axis_var.set(4)
+        panel.set_axis_mode()
+        panel.motion.mark_homed()
+        panel.source.cmds.clear()
+        c4 = panel.bar_canvases[3]
+        w4 = c4.winfo_width()
+        if w4 < 20:
+            w4 = c4.winfo_reqwidth()
+        panel._bar_press(_Evt(w4 * 0.80), 3)
+        panel._bar_release(_Evt(w4 * 0.80), 3)
+        assert panel.source.cmds and panel.source.cmds[0][1][0] == 3, "J4 指令轴号错误"
+
+        # 6) 真机链路：用假 robot 走一遍 G28 → 相对指令 → 未回零拦截
+        from p340_motion import _FakeRobot
+        panel.demo = False
+        src = _P340Source(panel.profile, "COM_TEST", 115200, False, lambda: 3,
+                          motion=panel.motion)
+        src.robot = _FakeRobot(True)
+        msgs = []
+        src.report = msgs.append
+        panel.motion.reset("测试")
+        src._exec("send", (0, 20.0, 20.0))
+        assert not any(c[0] == "set_angle" for c in src.robot.calls), \
+            "未回零仍下发了关节指令"
+        src.submit("home", None)
+        src._drain()
+        assert panel.motion.homed, "G28 应答后未置为已回零"
+        src._exec("send", (0, 20.0, 20.0))
+        assert panel.motion.joints[0] == 20.0, "相对指令未更新软件模型"
+        assert ("set_angle", 1, 20.0, panel.motion.speed) in src.robot.calls, \
+            "下行指令不是相对增量: {}".format(src.robot.calls)
+        assert any("回零完成" in m for m in msgs), "回零完成未回报状态"
+    finally:
+        root.destroy()
+    return True
+
+
+__all__ = ["P340Panel", "DEMO_PRESETS", "demo_angles", "panel_selftest",
+           "pose3d_selftest"]

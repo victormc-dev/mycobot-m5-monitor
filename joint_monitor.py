@@ -820,6 +820,15 @@ class MonitorApp(tk.Tk):
         """
         w = max(evt.width, 840)          # 三列 minsize 合计
         avail = max(300, evt.height)
+        if self.profile.key == "p340" and self.p340_view is not None:
+            # P340 面板自带三列布局，按可用高度铺满，不参与六轴的高度基准计算
+            self.p340_view.fit_height(avail)
+            self.host_canvas.itemconfig(self._body_win, width=w, height=avail)
+            self.host_canvas.configure(scrollregion=(0, 0, w, avail))
+            if self._vsb_visible:
+                self.vsb.pack_forget()
+                self._vsb_visible = False
+            return
         # 左列内容自然高度（固定 pack 布局，稳定；动态测量兜底）
         left_natural = max(LEFT_REQ_SHORT if (evt.height < 620) else LEFT_REQ_FULL,
                            self.left_frame.winfo_reqheight())
@@ -1721,6 +1730,11 @@ def selftest():
     assert profiles.over_limit(p340, [0, 0, 100]) == [3], "3 轴模式 J3 超限未识别"
     assert profiles.over_limit(p340, [0, 0, 100], p340.joint_limits_alt) == [], \
         "4 轴模式 J3 上限应为 110"
+    # 新增：P340 步进电机操作逻辑（回零门禁 / 相对坐标 / 软件模型角度）
+    import p340_motion
+    assert p340_motion.motion_selftest(), "P340 运动层自检失败"
+    print("P340_MOTION_OK guard=home_first mode=G91 angles=model_only max_step={}deg".format(
+        int(p340_motion.MAX_STEP_DEG)))
     print("P340_OK driver={} dof={} axes={} limits_ok=True".format(
         p340.driver_class, p340.dof, p340.dof_options))
     print("PROFILE_OK keys={} 320_driver={} geom_scale={} limits_ok=True".format(
@@ -1850,12 +1864,19 @@ def main():
     ap.add_argument("--demo", action="store_true", help="启动即进入演示模式并自动开始动画")
     ap.add_argument("--selftest", action="store_true", help="无界面自检并退出")
     ap.add_argument("--pose-test", action="store_true", help="创建窗口验证 3D 绘制后退出")
+    ap.add_argument("--p340-test", action="store_true",
+                    help="创建窗口验证 P340 回零门禁与拖动发指令后退出")
     args = ap.parse_args()
     if args.selftest:
         selftest()
         return 0
     if args.pose_test:
         pose_test()
+        return 0
+    if args.p340_test:
+        import p340_view
+        assert p340_view.panel_selftest(), "P340 面板自检失败"
+        print("P340_PANEL_SELFTEST_OK")
         return 0
     app = MonitorApp(force_demo=args.demo, model=args.model)
     app.mainloop()
