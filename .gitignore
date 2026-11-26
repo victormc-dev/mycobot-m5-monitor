@@ -6,8 +6,13 @@ __pycache__/
 *.pyo
 *.pyd
 
-# 本机临时脚本、wheel 与日志（不上传）
-.wheels/
+# 打包脚本入库，构建产物不上传（脚本丢失过一次，必须可复用）
+.wheels/dist/
+.wheels/build/
+.wheels/release/
+.wheels/payload.zip
+.wheels/*.spec
+.wheels/*.log
 
 # WorkBuddy 工作区数据（含会话记忆，私有）
 .workbuddy/
