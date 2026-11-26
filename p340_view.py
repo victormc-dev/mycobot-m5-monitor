@@ -263,6 +263,7 @@ class _P340Source:
         self.robot = None
         self.cmds = queue.Queue()
         self.report = lambda _text: None      # 由面板注入，回传状态到 UI 线程
+        self.on_home_done = lambda _ok: None  # 回零结束（成功/失败/异常）回调，由面板注入
         self._n = 0
         self._coords = None
 
@@ -358,20 +359,25 @@ class _P340Source:
 
     def _do_home(self):
         self.report("回零中（G28），约 10-20 秒，请勿触碰机械臂…")
-        ok = motion_mod.g28(self.robot, motion_mod.HOME_TIMEOUT)
-        if not ok:
-            self.motion.reset("回零失败")
-            self.report("回零失败：未收到 ok 应答（检查 12V 供电 / 串口 / 限位开关）")
-            return
         try:
-            self.robot.set_mode(1 if self.motion.mode == motion_mod.MODE_REL else 0)
-        except Exception:
-            pass
-        sw = motion_mod.switch_state(self.robot)
-        self.motion.mark_homed()
-        self.report("回零完成，已切{}模式{}".format(
-            motion_mod.MODE_LABELS[self.motion.mode],
-            "；限位开关 {}".format(sw) if sw else ""))
+            ok = motion_mod.g28(self.robot, motion_mod.HOME_TIMEOUT)
+            if not ok:
+                self.motion.reset("回零失败")
+                self.report("回零失败：未收到 ok 应答（检查 12V 供电 / 串口 / 限位开关）")
+                return
+            try:
+                self.robot.set_mode(1 if self.motion.mode == motion_mod.MODE_REL else 0)
+            except Exception:
+                pass
+            sw = motion_mod.switch_state(self.robot)
+            self.motion.mark_homed()
+            self.report("回零完成，已切{}模式{}".format(
+                motion_mod.MODE_LABELS[self.motion.mode],
+                "；限位开关 {}".format(sw) if sw else ""))
+        finally:
+            # 无论成功、超时失败还是异常，都必须通知 UI 复位「回零中」状态，
+            # 否则按钮会永久卡在 disabled，导致无法再次回零。
+            self.on_home_done(bool(self.motion.homed))
 
     def _do_mode(self, mode):
         self.motion.set_mode(mode)
@@ -444,6 +450,7 @@ class P340Panel(tk.Frame):
         # 外设与使能状态（真机由串口回报确认，演示模式仅本地切换）
         self.pump_on = False             # 吸泵：M22 开 / M23 关
         self.lock_on = True              # 阻尼锁定：M18 锁轴 / M17 松轴
+        self._homing = False             # G28 回零进行中；失败/异常后必须能复位
         # 操作记录与回放
         self.ops = []                    # 已执行记录，末尾为最新
         self.redo_ops = []               # 被撤销的记录，供重做
@@ -774,9 +781,16 @@ class P340Panel(tk.Frame):
 
     def _request_home(self):
         """回零入口。步进电机每次上电都必须先 G28，运动指令才被放行。"""
-        if self.running and not self.demo:
-            self.home_btn.config(state="disabled", text="回零中…")
-            self.on_status("P340 发送 G28 回零，请等待约 10-20 秒…")
+        if self.demo:
+            self._submit("home")
+            return
+        if not (self.running and self.source is not None):
+            self.on_status("P340 未连接：请先在主工具栏点「开始采集」建立串口")
+            return
+        self._homing = True
+        self.home_btn.config(state="disabled", text="回零中…")
+        self._refresh_home_badge()
+        self.on_status("P340 发送 G28 回零，请等待约 10-20 秒…")
         self._submit("home")
 
     def _on_mode_change(self):
@@ -945,12 +959,12 @@ class P340Panel(tk.Frame):
             self.home_badge.config(text="● 已回零", bg="#ECFDF5", fg="#047857")
             self.home_btn.config(state="normal", text="重新回零 G28")
             return
-        if self.running and str(self.home_btn["state"]) == "disabled":
+        if self._homing:
             self.home_badge.config(text="● 回零中", bg="#FEF9C3", fg="#A16207")
+            self.home_btn.config(state="disabled", text="回零中…")
             return
         self.home_badge.config(text="● 未回零", bg="#FEF2F2", fg="#B91C1C")
-        if str(self.home_btn["state"]) == "disabled":
-            self.home_btn.config(state="normal", text="回零 G28")
+        self.home_btn.config(state="normal", text="回零 G28")
 
     # ---------------------------------------------------------------- 角度条拖动
     def _can_drag(self):
@@ -1077,6 +1091,7 @@ class P340Panel(tk.Frame):
         # 吸泵与锁轴按固件默认值复位（掉电即关泵、上电即锁轴）
         self.pump_on = False
         self.lock_on = True
+        self._homing = False
         self._paint_toggles()
         if demo:
             self.motion.mark_homed()
@@ -1096,6 +1111,7 @@ class P340Panel(tk.Frame):
                           lambda: self._axis_n, lambda: self._preset,
                           motion=self.motion)
         src.report = lambda text: self.q.put(("status", text))
+        src.on_home_done = lambda ok: self.q.put(("home_done", ok))
         self.source = src
         try:
             src.open()
@@ -1114,6 +1130,7 @@ class P340Panel(tk.Frame):
         self.stop_evt.set()
         self.running = False
         self._bar_dragging = -1
+        self._homing = False
         self.motion.reset("采集已停止")
         self._refresh_home_badge()
         self.on_status("P340 已停止采集")
@@ -1139,6 +1156,9 @@ class P340Panel(tk.Frame):
                     self._refresh_home_badge()
                 elif kind == "status":
                     self.on_status(str(payload))
+                    self._refresh_home_badge()
+                elif kind == "home_done":
+                    self._homing = False
                     self._refresh_home_badge()
                 elif kind == "ready":
                     self._refresh_home_badge()
@@ -1592,6 +1612,36 @@ def panel_selftest():
         assert ("set_angle", 1, 20.0, panel.motion.speed) in src.robot.calls, \
             "下行指令不是相对增量: {}".format(src.robot.calls)
         assert any("回零完成" in m for m in msgs), "回零完成未回报状态"
+
+        # 6b) 回零失败也必须回调 home_done，按钮不得卡死在「回零中」
+        done = []
+        panel.demo = False
+        panel.motion.reset("测试：未回零")
+        _real_g28 = motion_mod.g28
+        motion_mod.g28 = lambda _robot, timeout=30: False
+        try:
+            src_fail = _P340Source(panel.profile, "COM_TEST", 115200, False, lambda: 3,
+                                   motion=panel.motion)
+            src_fail.robot = _FakeRobot(False)
+            src_fail.on_home_done = done.append
+            src_fail.report = lambda _t: None
+            src_fail._exec("home", None)
+        finally:
+            motion_mod.g28 = _real_g28
+        assert done and done[-1] is False, "回零失败未回调 home_done"
+        assert panel.motion.homed is False, "回零失败后仍误判已回零"
+
+        # 6c) 面板按钮随 home_done 恢复可用
+        panel.running = True
+        panel.source = _FakeSource()
+        panel._homing = False
+        panel.motion.reset("测试：未回零")
+        panel._request_home()
+        assert str(panel.home_btn["state"]) == "disabled", "回零中按钮应禁用"
+        panel._homing = False                        # 模拟 home_done 事件
+        panel._refresh_home_badge()
+        assert str(panel.home_btn["state"]) == "normal", "回零结束后按钮未恢复"
+        assert "未回零" in panel.home_badge["text"], "回零失败后徽标未回到未回零"
 
         # 7) 真机外设：吸泵 M22/M23、锁轴 M18/M17 必须落到串口
         src._exec("pump", True)

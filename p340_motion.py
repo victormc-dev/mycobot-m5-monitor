@@ -154,7 +154,7 @@ def g28(robot, timeout=HOME_TIMEOUT, expect="ok"):
         ser.reset_input_buffer()         # 丢掉上一条指令残留的 ok，避免误判成功
     except Exception:
         pass
-    ser.write("G28\r")
+    ser.write(b"G28\r")                  # pyserial 3.x 只收 bytes，str 会抛 TypeError
     ser.flush()
     buf = ""
     t0 = time.time()
@@ -183,7 +183,7 @@ def send(robot, command, timeout=0.6):
         return False
     try:
         ser.reset_input_buffer()
-        ser.write(command + "\r")
+        ser.write((command + "\r").encode("ascii"))
         ser.flush()
     except Exception:
         return False
@@ -243,7 +243,7 @@ def _query(robot, command, token, timeout):
         return None
     try:
         ser.reset_input_buffer()
-        ser.write(command + "\r")
+        ser.write((command + "\r").encode("ascii"))
         ser.flush()
     except Exception:
         return None
@@ -287,7 +287,11 @@ class _FakeSerial:
         self.writes = []
 
     def write(self, data):
-        cmd = data.decode() if isinstance(data, bytes) else data
+        # 真实 pyserial 3.x 的 write() 只收 bytes，对 str 会抛 TypeError；
+        # 这里同样断言，防止回归成 str 写入（那会导致真机「发了指令没响应」）。
+        assert isinstance(data, (bytes, bytearray)), \
+            "串口写入必须是 bytes/bytearray，收到: {!r}".format(data)
+        cmd = bytes(data).decode()
         self.writes.append(cmd)
         if not self.answer:
             return
